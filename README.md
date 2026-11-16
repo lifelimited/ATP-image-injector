@@ -5,7 +5,8 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.3.2-orange)
+![Version](https://img.shields.io/badge/Version-1.5.0-orange)
+![OCR](https://img.shields.io/badge/OCR-OpenThai2.0--OCR--Text-purple)
 
 ## Overview
 
@@ -23,11 +24,9 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ## Quick Start
 
-### Option 1: Run with Python / GPU (Recommended for v1.3.2+)
-
-
+### Option 1: Run with Python (Recommended for v1.5.0+)
  
-Since recent versions introduce a powerful AI OCR rotation feature (`easyocr` with PyTorch), compiling it to a standalone `.exe` would create a massive 3GB+ file. We strongly recommend running the app natively through Python using our setup scripts.
+Since v1.4.0 the Smart Rotate / MAC scanner OCR runs on **[OpenThai2.0-OCR-Text](https://huggingface.co/iapp/OpenThai2.0-OCR-Text)** — a ~4 MB Thai + English OCR model that runs on the **CPU only** (no GPU, no PyTorch). Setup is now a small download instead of 3 GB. The model files ship in `models/OpenThai2.0-OCR-Text/` and are re-downloaded from Hugging Face automatically if missing.
 
 **For Windows:**
 1. Double-click `setup_windows.bat` to install dependencies and create a local virtual environment. (You only need to do this once).
@@ -95,7 +94,7 @@ Photo_Root/
 | **Keyword** | Folder prefix to match (default: `WZP`, change as needed) |
 | **💾 Output File** | Where to save the result (default: `unit_test_with_images.docx`) |
 | **Auto-Rotate (EXIF)** | Check to use the basic camera orientation data. |
-| **Smart Rotate (EasyOCR GPU)** | **Highly recommended.** Check this to use your GPU to scan the photo for text and forcefully rotate it so it is readable from left-to-right. Required if you take sideways photos of wide devices (like IP Phones). |
+| **Smart Rotate (OpenThai OCR · CPU)** | **Highly recommended.** Reads the text in each photo with OpenThai2.0-OCR-Text and rotates it 90°/180°/270° so it reads left-to-right. Required if you take sideways photos of wide devices (like IP Phones). |
 
 ### Step 4: Run
 
@@ -157,8 +156,19 @@ The `.exe` will be created at `dist/Unit_Test_Image_Injector.exe`
   - `python-docx` — Word document manipulation
   - `Pillow` — Image processing
   - `pillow-heif` — HEIC/HEIF support
-  - `easyocr` — Smart text orientation scanning
+  - `onnxruntime`, `opencv-python-headless`, `pyclipper` — OpenThai2.0-OCR-Text runtime
+  - `huggingface_hub` — auto-downloads the model if `models/` is missing
   - `numpy` & `openpyxl`
+
+### OCR engine configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `OCR_BACKEND` env var | `openthai` | `openthai` = OpenThai2.0-OCR-Text (CPU). `easyocr` = legacy engine (`pip install easyocr`). |
+| `OPENTHAI_OCR_DIR` env var | `models/OpenThai2.0-OCR-Text` | Use a model folder elsewhere. |
+| `pip install openvino` | not installed | Optional — the runtime uses OpenVINO automatically when present (faster on Intel CPUs), otherwise ONNX Runtime. |
+
+All OCR goes through [`ocr_engine.py`](ocr_engine.py) (`get_engine()`, `detect_orientation()`), used by both `app.py` and `mac_scanner.py`.
 
 ### For running the .exe:
 - Windows 10/11
@@ -173,7 +183,19 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
-### v1.3.2 (Current) (Beta)
+### v1.5.0 (Current)
+- 📑 **Starting Table / Page Selection** — Choose which table index (1-based) to start injecting from, skipping cover/revision/summary tables automatically.
+- 🧭 **Multi-Table Layout Picker** — Navigate across any table in the `.docx` (`◀ Previous`, `Next ▶`, or `Table X of N` dropdown) inside **Configure Table Layout** to map S/N and Image cells.
+- 🏷 **Auto Device Model Detection & Filter** — Automatically detects device models across Cisco, Huawei, and TP-Link documents/folders (including `Part Number` ➔ `Description` summary mapping) with a multi-select checklist in the GUI.
+- 🛡 **Adversarial Hardening & 100-Test Suite** — Boundary clamping, camera-subfolder exclusion (`DCIM`, `100APPLE`), and 100 unit/GUI/E2E tests.
+
+### v1.4.0
+- 🧠 **New OCR engine: [OpenThai2.0-OCR-Text](https://huggingface.co/iapp/OpenThai2.0-OCR-Text)** (iApp, Apache-2.0) replaces EasyOCR — Thai + English, CPU-only, ~4 MB model instead of ~3 GB of PyTorch.
+- ⚡ **Faster Smart Rotate** — ~0.3–0.7 s per photo on CPU; the engine detects sideways text itself, so only 2 OCR passes per photo instead of 4.
+- 🔌 **Pluggable backend** — new `ocr_engine.py`; `OCR_BACKEND=easyocr` keeps the old engine available.
+- 🔎 **MAC scanner v3.0** — `mac_scanner.py` uses the same engine and also considers low-confidence lines (LCD text).
+
+### v1.3.2
 - 🚀 **Universal Document Support** — AI rotation now handles generic documents by dynamically scoring text density rather than strictly searching for rigid keywords.
 - 📦 **Automated Native Setup** — Introduced `setup_windows.bat` and `setup_mac.command` scripts alongside `requirements.txt` to eliminate the need for downloading a 3GB executable.
 - 🐛 **HEIC Skipping Bug Fix** — Repaired logic flaw where HEIC files were skipping internal format conversion loops.

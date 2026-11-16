@@ -28,6 +28,17 @@ __pycache__/
 # Output
 matched_results.txt
 ocr_matched_files/
+*.zip
+
+# Local scratch / ad-hoc scripts & private data folders
+SVB/
+docx_inject.py
+mac_scanner.py
+inspect_docx.py
+read_excel.py
+test/zip.txt
+test/test_integration.py
+test/test_scan.py
 
 # IDE
 .vscode/

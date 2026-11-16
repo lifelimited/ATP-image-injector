@@ -1,7 +1,7 @@
 @echo off
-echo Installing required libraries (EasyOCR, etc.). This may take a few minutes the first time...
-pip install easyocr python-docx pillow-heif
+echo Installing required libraries (OpenThai OCR runtime, etc.). This only takes a minute...
+pip install -r "%~dp0requirements.txt"
 echo.
 echo Starting Unit Test Image Injector (Python Script Mode)...
-python app.py
+python "%~dp0app.py"
 pause

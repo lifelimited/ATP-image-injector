@@ -1,6 +1,14 @@
-easyocr
 numpy
 Pillow
 pillow-heif
 python-docx
 openpyxl
+# OCR engine: iapp/OpenThai2.0-OCR-Text (CPU-only, model files in models/)
+onnxruntime
+opencv-python-headless
+pyclipper
+huggingface_hub
+# Optional: faster inference on Intel CPUs (auto-used when installed)
+# openvino
+# Optional: legacy engine (set OCR_BACKEND=easyocr), pulls in PyTorch ~3 GB
+# easyocr
