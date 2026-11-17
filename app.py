@@ -1348,6 +1348,76 @@ def _move_read_doubt(key: str, own: str, doc_serials: dict[str, str], how: str =
     return ""
 
 
+def _lookalike_rivals(key: str, doc_serials: dict[str, str]) -> set:
+    """Other document serials that differ from key only by OCR look-alikes (distance < VERIFY_LOOKALIKE)."""
+    return {s for s in doc_serials if s != key and abs(len(s) - len(key)) <= 1
+            and _levenshtein(key, s, max_dist=1.0) < VERIFY_LOOKALIKE}
+
+
+CONFIRM_HEIGHTS = (40.0, 56.0, 72.0)   # text heights (px) of the zoomed re-reads
+CONFIRM_MIN_AGREE = 5                  # of 6 variants (3 heights x plain / contrast+sharpen)
+
+
+def _label_tokens(lines: list[str]) -> set:
+    toks = set()
+    for text in lines:
+        m = _OCR_SN_PREFIX_REGEX.search(text)
+        if m:
+            toks.add(normalize_sn(m.group(1)))
+        toks.add(normalize_sn(text))
+        toks.update(normalize_sn(t) for t in _SN_SPLIT_REGEX.split(text))
+    return {t for t in toks if len(t) >= 6}
+
+
+def _confirm_label_read(img_path: str, engine, key: str, rivals: set, doc_serials: dict[str, str]) -> tuple[bool, str]:
+    """
+    Re-read a label whose serial has look-alike rivals in the document (e.g. 'PGH' vs 'P6H'):
+    the label line is cropped and read in 6 variants (text height 40/56/72 px x plain / autocontrast+sharpen).
+    Confirmed only when >= CONFIRM_MIN_AGREE variants read exactly key and no variant reads a rival,
+    another serial, or a token at a rival's position (a single '6' vetoes 'G').
+    Returns (confirmed, detail).
+    """
+    from PIL import Image as PILImage, ImageOps, ImageFilter
+    img = _load_photo_for_ocr(img_path)
+    res = engine.read(img)
+    lines = [ln for ln in getattr(res, "lines", []) if getattr(ln, "box", None)]
+    target = [ln for ln in lines if find_serial_in_ocr_lines([ln.text], doc_serials)[0] == key]
+    if not target:
+        target = sorted((ln for ln in lines if _serial_like_line(ln.text)),
+                        key=lambda ln: 0 if _OCR_SN_PREFIX_REGEX.search(ln.text) else 1)[:1]
+    if target:
+        ln = target[0]
+        xs = [pt[0] for pt in ln.box]
+        ys = [pt[1] for pt in ln.box]
+        h = max(ys) - min(ys)
+        if h <= 0:
+            return False, "label line has no height"
+        x0, y0 = int(max(0, min(xs) - 2 * h)), int(max(0, min(ys) - 1.5 * h))
+        x1, y1 = int(min(img.width, max(xs) + 2 * h)), int(min(img.height, max(ys) + 1.5 * h))
+        if x1 <= x0 or y1 <= y0:
+            return False, "label line outside the photo"
+        base = img.crop((x0, y0, x1, y1))
+    else:   # engines without line boxes: re-read the whole photo
+        base, h = img, None
+    agree, seen = 0, []
+    for target_px in CONFIRM_HEIGHTS:
+        scale = min(8.0, max(1.0, target_px / h)) if h else target_px / CONFIRM_HEIGHTS[0]
+        big = base.resize((max(1, int(base.width * scale)), max(1, int(base.height * scale))), PILImage.LANCZOS)
+        for variant in (big, ImageOps.autocontrast(big).filter(ImageFilter.SHARPEN)):
+            texts = engine.read(variant).texts(include_dropped=True)
+            k2, how2 = find_serial_in_ocr_lines(texts, doc_serials)
+            toks = _label_tokens(texts)
+            if toks & rivals or (k2 and k2 in rivals):
+                return False, f"a re-read shows {doc_serials[(toks & rivals or {k2}).pop()]}"
+            if k2 and k2 != key:
+                return False, f"a re-read shows {doc_serials[k2]}"
+            if k2 == key and how2 == "exact":
+                agree += 1
+            seen.append(how2 or "-")
+    ok = agree >= CONFIRM_MIN_AGREE
+    return ok, f"{agree}/{len(seen)} zoomed re-reads exact"
+
+
 def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engine=None,
                          sticker_lookup: dict[int, list[dict]] | None = None, time_fn=None,
                          log_cb=None, cancel_event=None, max_fuzzy: float = VERIFY_MAX_FUZZY) -> list[dict]:
@@ -1397,18 +1467,59 @@ def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engin
 
         strong = {p: k for p, k, h in reads if k and _strong_label_read(h, max_fuzzy)}
         hows = {p: h for p, _k, h in reads}
+        pending: dict[str, list] = {}          # look-alike ambiguous reads: serial -> [paths]
         for p, k in list(strong.items()):
             why = _move_read_doubt(k, own, doc_serials, hows[p]) if k != own else ""
             if why:
                 del strong[p]
+                if why.startswith("look-alike"):
+                    pending.setdefault(k, []).append(p)
                 log(f"      [VERF] {f['name']}/{os.path.basename(p)}: S/N read {doc_serials[k]} not trusted "
                     f"for a move ({why})")
+        doubted = {p for paths in pending.values() for p in paths} | {
+            p for p, k, h in reads if k and k != own and _strong_label_read(h, max_fuzzy) and p not in strong}
+        # A weaker (fuzzy) label read of the same serial may be the second photo, if it passes the re-read too
+        for p, k, h in reads:
+            if k in pending and p not in pending[k] and h and not h.startswith("sticker"):
+                pending[k].append(p)
+        # A look-alike ambiguous serial is trusted again only with >= 2 photos that each pass the zoomed
+        # re-read, and no photo of the folder reading a look-alike rival or the folder's own serial.
+        # Exactly one such photo is kept for the swap check (see _swap_pair_proposals).
+        single_confirmed = None
+        for k, paths in pending.items():
+            rivals = _lookalike_rivals(k, doc_serials) | ({own} if own else set())
+            if any(rk in rivals for _p, rk, _h in reads if rk):
+                log(f"      [VERF] {f['name']}: {doc_serials[k]} not confirmed - another photo reads a look-alike "
+                    f"or the folder's own S/N")
+                continue
+            results = []
+            for p in paths:
+                try:
+                    results.append(_confirm_label_read(p, engine, k, rivals, doc_serials))
+                except Exception as e:
+                    results.append((False, f"re-read failed ({e})"))
+            good = [p for p, (ok, _d) in zip(paths, results) if ok]
+            details = "; ".join(d for _ok, d in results)
+            if len(good) >= 2:
+                for p in good:
+                    strong[p] = k
+                log(f"      [VERF] {f['name']}: {doc_serials[k]} confirmed by {len(good)} photo(s) ({details})")
+            else:
+                if len(good) == 1 and len(pending) == 1:
+                    single_confirmed = k
+                log(f"      [VERF] {f['name']}: {doc_serials[k]} not confirmed ({details})")
+        f["verify_info"] = {
+            "own_read": any(k == own for _p, k, _h in reads),
+            "label_keys": {k for _p, k, h in reads if k and h and not h.startswith("sticker")},
+            "trusted_label_keys": {k for _p, k, h in reads if k and _strong_label_read(h, max_fuzzy)},
+            "single_confirmed": single_confirmed,
+        }
         foreign = {p: k for p, k in strong.items() if k != own}
         for p, k, h in reads:
             if k and k != own and h.startswith("sticker"):
                 log(f"      [VERF] {f['name']}/{os.path.basename(p)}: sticker {h.split()[1]} says "
                     f"{doc_serials[k]} - sticker alone never moves a photo")
-            elif k and k != own and p not in strong:
+            elif k and k != own and p not in strong and p not in doubted:
                 log(f"      [VERF] {f['name']}/{os.path.basename(p)}: weak S/N read {doc_serials[k]} ({h}) "
                     f"- not trusted for a move")
         if not foreign:
@@ -1460,6 +1571,72 @@ def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engin
     return proposals
 
 
+def _swap_pair_proposals(folders: list[dict], proposals: list[dict], holders: dict, doc_serials: dict,
+                         log) -> list[dict]:
+    """
+    Two folders whose names were swapped: folder A (serial a) moves whole to b on trusted reads, and folder B
+    (serial b) was not moved because its label read of a was not trusted alone. B also moves whole to a when:
+      - B has no read of b at all (label or sticker),
+      - every S/N label read in B names a, at least one of them exact or near-exact,
+      - a and b are not close (distance > VERIFY_OWN_MISREAD), so B's read cannot be a misread of its own label.
+    Returns the extra proposals for B (logged as [SWAP]).
+    """
+    extra = []
+    moving = {pr["folder"] for pr in proposals}
+    whole_to: dict[int, str] = {}
+    for pr in proposals:
+        if pr["whole"]:
+            whole_to[pr["folder"]] = pr["to"]
+    for a_idx, b in whole_to.items():
+        a = folders[a_idx].get("expected")
+        if not a:
+            continue
+        for b_idx in holders.get(b, []):
+            info = folders[b_idx].get("verify_info")
+            if b_idx in moving or not info or info["own_read"]:
+                continue
+            if info["label_keys"] != {a} or a not in info["trusted_label_keys"]:
+                continue
+            if _levenshtein(a, b, max_dist=VERIFY_OWN_MISREAD) <= VERIFY_OWN_MISREAD:
+                continue
+            fb = folders[b_idx]
+            log(f"    [SWAP] folders {folders[a_idx]['name']} and {fb['name']} hold each other's photos - "
+                f"both moved")
+            for p in fb["imgs"]:
+                extra.append({"folder": b_idx, "path": p, "to": a, "whole": True,
+                              "reason": f"swapped with folder {folders[a_idx]['name']} (labels read "
+                                        f"{doc_serials.get(a, a)})"})
+            moving.add(b_idx)
+
+    # Both halves blocked as look-alikes: each folder has exactly one label photo that passed the zoomed
+    # re-read, naming the other folder's serial (two independent confirmed photos, as in the 2-photo rule).
+    by_serial = {f.get("expected"): i for i, f in enumerate(folders) if f.get("verify_info")}
+    for a_idx, fa in enumerate(folders):
+        ia = fa.get("verify_info")
+        if a_idx in moving or not ia or ia["own_read"] or not ia.get("single_confirmed"):
+            continue
+        a, b = fa["expected"], ia["single_confirmed"]
+        b_idx = by_serial.get(b)
+        if b_idx is None or b_idx in moving or b_idx == a_idx:
+            continue
+        fb = folders[b_idx]
+        ib = fb["verify_info"]
+        if ib["own_read"] or ib.get("single_confirmed") != a:
+            continue
+        if not ia["label_keys"] <= {b} or not ib["label_keys"] <= {a}:
+            continue
+        if _levenshtein(a, b, max_dist=VERIFY_OWN_MISREAD) <= VERIFY_OWN_MISREAD:
+            continue
+        log(f"    [SWAP] folders {fa['name']} and {fb['name']} hold each other's photos "
+            f"(each confirmed by a zoomed re-read) - both moved")
+        for src_idx, f_src, to, other in ((a_idx, fa, b, fb), (b_idx, fb, a, fa)):
+            for p in f_src["imgs"]:
+                extra.append({"folder": src_idx, "path": p, "to": to, "whole": True,
+                              "reason": f"swapped with folder {other['name']} (label confirmed by zoomed re-reads)"})
+        moving.update({a_idx, b_idx})
+    return extra
+
+
 def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holders: set | None = None,
                         doc_serials: dict[str, str] | None = None, log_cb=None) -> list[dict]:
     """
@@ -1480,7 +1657,8 @@ def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holder
     for i, f in enumerate(folders):
         if f.get("expected"):
             holders.setdefault(f["expected"], []).append(i)
-    accepted = list(proposals)
+    accepted = list(proposals) + _swap_pair_proposals(folders, proposals, holders, doc_serials, log)
+    proposals = accepted[:]
     rejected_why: dict[str, str] = {}
     while True:
         out_count: dict[int, int] = {}

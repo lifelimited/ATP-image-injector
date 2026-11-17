@@ -206,9 +206,9 @@ S/N always wins. A table already matched by an S/N folder or by OCR never takes 
 
 ### Verify photos
 Auto mode trusts folder names, so a photo of device B left in device A's folder normally goes into A's table. With **Verify photos** on, every photo of the S/N and set-number folders is OCR'd as well:
-- A photo is moved only on an **exact or near-exact S/N label** read. A set-number sticker can confirm a folder but never moves a photo, and neither can a read that another serial of the document resembles (OCR look-alikes such as `6`/`G`) or a fuzzy read close to the folder's own S/N.
+- A photo is moved only on an **exact or near-exact S/N label** read. A set-number sticker can confirm a folder but never moves a photo, and neither can a fuzzy read close to the folder's own S/N. A read that another serial of the document resembles (OCR look-alikes such as `6`/`G`) moves only after 6 zoomed re-reads agree and a second photo confirms it.
 - If all readable labels of a folder name device B, the **whole folder** (unread photos too) goes to B. A **mixed** folder is split by label: unread photos follow a label photo shot ≤ 90 s apart, and the log warns.
-- Photos are **never added to a table that has its own photos**. They stay where they are and the log says `[WARN] … NOT moved`. Two folders whose names were swapped are both corrected.
+- Photos are **never added to a table that has its own photos**. They stay where they are and the log says `[WARN] … NOT moved`. Two folders whose names were swapped are corrected as a pair (`[SWAP]` in the log).
 - Only the Word output changes. The summary report lists every moved photo under **Photos moved (wrong folder)**.
 
 ### Example log

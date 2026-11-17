@@ -739,3 +739,110 @@ def test_verify_lookalike_or_own_misread_never_moves(tmp_path, monkeypatch):
     assert app._move_read_doubt("AAA123456X", "AAA1234568", ser, "fuzzy0.3")   # likely own label misread
     assert not app._move_read_doubt("AAA123456X", "AAA1234568", ser, "exact")
     assert app._move_read_doubt("AAA123456B", "AAA123456X", ser, "exact")      # look-alike of ...68
+
+
+def _doc_serials(*sns):
+    def make(path):
+        doc = Document()
+        for sn in sns:
+            t = doc.add_table(rows=3, cols=2)
+            t.rows[0].cells[0].text = "Serial Number:"
+            t.rows[0].cells[1].text = sn
+            _merged_empty_row(t, 2)
+        doc.save(str(path))
+    return make
+
+
+class _ReReadEngine:
+    """First read: one boxed label line; later reads (zoomed variants) return the queued texts."""
+    def __init__(self, first, variants):
+        self.first, self.variants, self.calls = first, list(variants), 0
+
+    def read(self, img):
+        self.calls += 1
+        if self.calls == 1:
+            lines = [_BoxLine(self.first, [(10, 40), (90, 40), (90, 50), (10, 50)])]
+            texts = [self.first]
+        else:
+            texts = [self.variants.pop(0)] if self.variants else []
+            lines = []
+
+        class _R:
+            pass
+        r = _R()
+        r.lines = lines
+        r.texts = lambda include_dropped=False: texts
+        return r
+
+
+def test_confirm_label_read_needs_unanimous_zoomed_reads(tmp_path):
+    p = str(tmp_path / "x.png")
+    Image.new("RGB", (120, 90), _BLUE).save(p)
+    ser = {"BBB7654321": "BBB7654321", "BBB765432I": "BBB765432I"}
+    rivals = {"BBB765432I"}
+    ok, _ = app._confirm_label_read(p, _ReReadEngine("S/N: BBB7654321", ["S/N: BBB7654321"] * 6),
+                                    "BBB7654321", rivals, ser)
+    assert ok
+    one_rival = ["S/N: BBB7654321"] * 5 + ["S/N: BBB765432I"]     # a single 'I' for '1' vetoes
+    ok, why = app._confirm_label_read(p, _ReReadEngine("S/N: BBB7654321", one_rival), "BBB7654321", rivals, ser)
+    assert not ok and "BBB765432I" in why
+    too_few = ["S/N: BBB7654321"] * 4 + ["noise", "noise"]
+    ok, _ = app._confirm_label_read(p, _ReReadEngine("S/N: BBB7654321", too_few), "BBB7654321", rivals, ser)
+    assert not ok
+
+
+def test_verify_lookalike_read_moves_with_two_confirmed_photos(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _BLUE)
+    _photo(str(root / "AAA1234567" / "2.png"), (0, 0, 254))    # second label shot of B
+    _photo(str(root / "AAA1234567" / "3.png"), _GREEN)
+    eng = {_BLUE: ["S/N: BBB7654321"], (0, 0, 254): ["S/N: BBB7654321"]}
+    docf = _doc_serials("AAA1234567", "BBB7654321", "BBB765432I")
+    monkeypatch.setattr(app, "_confirm_label_read", lambda *a, **k: (True, "6/6 zoomed re-reads exact"))
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, by_color=eng, docf=docf)
+    assert _count_pictures(d.tables[0]) == 0 and _count_pictures(d.tables[1]) == 3
+    assert any("confirmed by 2 photo(s)" in line for line in logs)
+
+    # one re-read fails -> only 1 confirmed photo -> nothing moves
+    calls = iter([(True, "ok"), (False, "a re-read shows BBB765432I")])
+    monkeypatch.setattr(app, "_confirm_label_read", lambda *a, **k: next(calls))
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, by_color=eng, docf=docf)
+    assert _count_pictures(d.tables[0]) == 3 and _count_pictures(d.tables[1]) == 0
+
+
+def test_verify_swapped_pair_moves_when_one_half_is_lookalike_blocked(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _BLUE)      # B's label, trusted
+    _photo(str(root / "AAA1234567" / "2.png"), _GREY)
+    _photo(str(root / "BBB7654321" / "3.png"), _RED)       # A's label, but 'AAA123456I' is a look-alike
+    _photo(str(root / "BBB7654321" / "4.png"), _GREEN)
+    docf = _doc_serials("AAA1234567", "BBB7654321", "AAA123456I")
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=docf)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 2
+    assert any("[SWAP]" in line for line in logs)
+
+    # B's folder also reads its own serial -> not a swap, nothing moves
+    _photo(str(root / "BBB7654321" / "5.png"), (0, 0, 253))
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=docf,
+                               by_color={**_VERIFY_ENGINE, (0, 0, 253): ["S/N: BBB7654321"]})
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 3
+    assert not any("[SWAP]" in line for line in logs)
+
+
+def test_verify_swap_both_halves_lookalike_needs_confirmed_rereads(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _BLUE)      # B's label; 'BBB765432I' is a look-alike
+    _photo(str(root / "AAA1234567" / "2.png"), _GREY)
+    _photo(str(root / "BBB7654321" / "3.png"), _RED)       # A's label; 'AAA123456I' is a look-alike
+    _photo(str(root / "BBB7654321" / "4.png"), _GREEN)
+    docf = _doc_serials("AAA1234567", "BBB7654321", "AAA123456I", "BBB765432I")
+    monkeypatch.setattr(app, "_confirm_label_read", lambda *a, **k: (False, "0/6 zoomed re-reads exact"))
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=docf)
+    assert _count_pictures(d.tables[0]) == 2 and not any("[SWAP]" in line for line in logs)
+    assert "Photos moved" not in open(res["summary_path"], encoding="utf-8-sig").read()
+    monkeypatch.setattr(app, "_confirm_label_read", lambda *a, **k: (True, "6/6 zoomed re-reads exact"))
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=docf)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 2
+    assert any("[SWAP]" in line for line in logs)
+    moved = open(res["summary_path"], encoding="utf-8-sig").read()
+    assert "Photos moved (wrong folder) (4)" in moved
