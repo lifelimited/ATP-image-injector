@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+### Added
+- **Verify photos (OCR every folder)**: new `verify_photos` option in `run_injection()`, a **Verify photos (OCR every folder, slower)** checkbox under Auto-match (off by default) and `--verify` in `--cli`. Photos in S/N folders and set-number folders are OCR'd too, so a photo of device B left in device A's folder goes into B's table (`verify_folder_photos()`, `resolve_photo_moves()`). A wrong move is worse than no move, so it is strict:
+  - only an exact or near-exact S/N label read (fuzzy distance ≤ 1.0, `VERIFY_MAX_FUZZY`) moves a photo; a set-number sticker may confirm the folder's own device but never moves a photo;
+  - a read is not trusted for a move when another document serial differs from it only by OCR look-alikes (`P6H` read as `PGH`, both real serials), or when a fuzzy read is close to the folder's own serial (own label `NJ6` read as `NI6` → `NTG`) (`_move_read_doubt()`);
+  - all readable labels in a folder name device B (none name A) → the whole folder goes to B, unread photos included; a mixed folder is split by label, unread photos follow a label shot ≤ 90 s apart, and the log warns;
+  - photos never go into a table that keeps its own photos (its S/N folder, set folder or OCR group), and photos of one device found in several folders are not moved; both cases are logged as `[WARN] … NOT moved` (two swapped folders do move);
+  - only the Word output changes, files on disk are never moved or renamed;
+  - the summary report has a new **Photos moved (wrong folder)** section (photo, from folder, to table with ชุดที่ and S/N, reason), and a table whose folder held only another device's photos says so under *Missing*.
+- Validation on hard-link copies of 40 S/N folders (119 photos) of a delivered document, with 33 photos deliberately misplaced (4 devices' photos dropped into another device's folder, 3 pairs of folder names swapped, 3 single photos moved), two random samples: **0 wrong moves**, 6 correct moves each, the rest left in place with a `[WARN]`/`[VERF]` line. Before the look-alike guards the first sample had 14 correct and 2 wrong moves. Runtime 37 s → 145 s (≈ +0.9 s per photo, Smart Rotate off).
+- 11 tests in `test/test_auto_match.py` (fake OCR, made-up serials).
+
 ## [1.6.0] - 2026-11-17
 ### Added
 - **Auto Mode (Auto-match S/N)**: New `auto_match` option in `run_injection()` and an **Auto-match S/N (scan whole table)** checkbox (on by default). Every cell of each table is scanned for a serial matching a photo folder name, so no keyword or S/N/Image cell setup is needed and documents with different table layouts work as-is.

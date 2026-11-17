@@ -1332,6 +1332,22 @@ def _strong_label_read(how: str, max_fuzzy: float = VERIFY_MAX_FUZZY) -> bool:
     return m.group(1) == "exact" or float(m.group(2)) <= max_fuzzy + 1e-9
 
 
+VERIFY_OWN_MISREAD = 1.5   # a read this close to the folder's own serial is taken as a misread of its own label
+VERIFY_LOOKALIKE = 1.0     # another document serial closer than this (look-alikes only) makes a read ambiguous
+
+
+def _move_read_doubt(key: str, own: str, doc_serials: dict[str, str], how: str = "fuzzy") -> str:
+    """Why a label read of another device must not move a photo, or '' if it may.
+    Real cases: the folder's own 'NJ6' read as 'NI6' -> fuzzy match 'NTG'; 'P6H' read exactly as 'PGH',
+    also a real serial. An exact read differing from the folder's serial by a real character is trusted."""
+    if own and not how.startswith("exact") and _levenshtein(key, own, max_dist=VERIFY_OWN_MISREAD) <= VERIFY_OWN_MISREAD:
+        return f"close to the folder's own S/N {doc_serials.get(own, own)}"
+    for s in doc_serials:
+        if s != key and abs(len(s) - len(key)) <= 1 and _levenshtein(key, s, max_dist=1.0) < VERIFY_LOOKALIKE:
+            return f"look-alike of {doc_serials[s]}"
+    return ""
+
+
 def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engine=None,
                          sticker_lookup: dict[int, list[dict]] | None = None, time_fn=None,
                          log_cb=None, cancel_event=None, max_fuzzy: float = VERIFY_MAX_FUZZY) -> list[dict]:
@@ -1380,6 +1396,13 @@ def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engin
             break
 
         strong = {p: k for p, k, h in reads if k and _strong_label_read(h, max_fuzzy)}
+        hows = {p: h for p, _k, h in reads}
+        for p, k in list(strong.items()):
+            why = _move_read_doubt(k, own, doc_serials, hows[p]) if k != own else ""
+            if why:
+                del strong[p]
+                log(f"      [VERF] {f['name']}/{os.path.basename(p)}: S/N read {doc_serials[k]} not trusted "
+                    f"for a move ({why})")
         foreign = {p: k for p, k in strong.items() if k != own}
         for p, k, h in reads:
             if k and k != own and h.startswith("sticker"):

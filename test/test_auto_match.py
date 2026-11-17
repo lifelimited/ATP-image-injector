@@ -573,3 +573,169 @@ def test_find_empty_folders(tmp_path):
     os.makedirs(str(tmp_path / "A" / "SN2"))
     os.makedirs(str(tmp_path / "B" / "SN3" / "DCIM"))
     assert app.find_empty_folders(str(tmp_path)) == ["B", "DCIM", "SN2", "SN3"]
+
+
+# ── Verify photos: OCR every S/N / set folder, move photos of another device (made-up serials) ──
+
+_RED, _BLUE, _GREEN, _GREY = (255, 0, 0), (0, 0, 255), (0, 255, 0), (128, 128, 128)
+_VERIFY_ENGINE = {_RED: ["S/N: AAA1234567"], _BLUE: ["S/N: BBB7654321"]}   # green / grey: no label
+
+
+def _two_serial_doc(path):
+    doc = Document()
+    for sn in ("AAA1234567", "BBB7654321"):
+        t = doc.add_table(rows=3, cols=2)
+        t.rows[0].cells[0].text = "Serial Number:"
+        t.rows[0].cells[1].text = sn
+        _merged_empty_row(t, 2)
+    doc.save(str(path))
+
+
+def _run_verify(tmp_path, monkeypatch, root, verify=True, by_color=None, docf=_two_serial_doc):
+    p = tmp_path / "doc.docx"
+    docf(p)
+    import ocr_engine
+    eng = _FakeEngine(by_color or _VERIFY_ENGINE)
+    monkeypatch.setattr(ocr_engine, "get_engine", lambda *a, **k: eng)
+    logs = []
+    out = tmp_path / "out.docx"
+    res = app.run_injection(str(p), str(root), str(out), auto_match=True, photo_ocr=True,
+                            set_number_fallback=True, verify_photos=verify,
+                            auto_rotate=False, smart_rotate=False, log_callback=logs.append)
+    d = Document(str(out)) if os.path.isfile(str(out)) else None
+    return res, d, logs
+
+
+def test_strong_label_read_rules():
+    assert app._strong_label_read("exact")
+    assert app._strong_label_read("exact+zoom")
+    assert app._strong_label_read("fuzzy0.7+zoom")
+    assert app._strong_label_read("exact [sticker 2/9 says X]")
+    assert not app._strong_label_read("fuzzy2.0")
+    assert not app._strong_label_read("sticker 2/9")
+    assert not app._strong_label_read("sticker 2/9+zoom")
+    assert not app._strong_label_read("")
+
+
+def test_verify_moves_single_photo_in_wrong_folder(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _RED)
+    _photo(str(root / "AAA1234567" / "2.png"), _BLUE)     # device B's label photo, wrong folder
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root)
+    assert _count_pictures(d.tables[0]) == 1 and _count_pictures(d.tables[1]) == 1
+    text = open(res["summary_path"], encoding="utf-8-sig").read()
+    assert "Photos moved (wrong folder) (1)" in text and "2.png" in text and "BBB7654321" in text
+    assert os.path.isfile(str(root / "AAA1234567" / "2.png"))   # nothing moved on disk
+
+
+def test_verify_off_keeps_folder_names(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _RED)
+    _photo(str(root / "AAA1234567" / "2.png"), _BLUE)
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, verify=False)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 0
+    assert "Photos moved" not in open(res["summary_path"], encoding="utf-8-sig").read()
+
+
+def test_verify_moves_whole_folder_including_unread(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _BLUE)
+    _photo(str(root / "AAA1234567" / "2.png"), _GREEN)    # unread wide shot follows the folder
+    _photo(str(root / "AAA1234567" / "3.png"), _GREY)
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root)
+    assert _count_pictures(d.tables[0]) == 0 and _count_pictures(d.tables[1]) == 3
+    text = open(res["summary_path"], encoding="utf-8-sig").read()
+    assert "Photos moved (wrong folder) (3)" in text
+    assert "showed another S/N (moved)" in text          # reason why table A has no photos
+
+
+def test_verify_swapped_folders_both_move(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _BLUE)
+    _photo(str(root / "AAA1234567" / "2.png"), _GREEN)
+    _photo(str(root / "BBB7654321" / "3.png"), _RED)
+    _photo(str(root / "BBB7654321" / "4.png"), _GREY)
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 2
+    assert res.img_count == 4
+    assert "Photos moved (wrong folder) (4)" in open(res["summary_path"], encoding="utf-8-sig").read()
+
+
+def test_verify_never_fills_table_that_has_own_photos(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _RED)
+    _photo(str(root / "AAA1234567" / "2.png"), _BLUE)
+    _photo(str(root / "BBB7654321" / "3.png"), _GREY)     # B has its own photo
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 1
+    assert any("NOT moved" in line and "own photos" in line for line in logs)
+    assert "Photos moved" not in open(res["summary_path"], encoding="utf-8-sig").read()
+
+
+def test_verify_weak_fuzzy_read_never_moves(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _RED)
+    _photo(str(root / "AAA1234567" / "2.png"), _GREEN)
+    # 'BBB76X43Z1' is 2 edits from BBB7654321: a fuzzy read too far to move a photo
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root,
+                               by_color={_RED: ["S/N: AAA1234567"], _GREEN: ["S/N: BBB76X43Z1"]})
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 0
+
+
+def _sticker_doc(path):
+    doc = Document()
+    _detail_table(doc, "Switch", 1, 2, "PN-777", "SWQ00000001")
+    _detail_table(doc, "Switch", 2, 2, "PN-777", "SWQ00000002")
+    doc.save(str(path))
+
+
+def test_verify_sticker_alone_never_moves(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "SWQ00000001" / "1.png"), _RED)
+    _photo(str(root / "SWQ00000001" / "2.png"), _BLUE)    # sticker of set 2/2 only
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=_sticker_doc,
+                               by_color={_RED: ["S/N: SWQ00000001"], _BLUE: ["2/2"]})
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 0
+    assert any("sticker alone never moves" in line for line in logs)
+
+
+def test_verify_set_folder_photo_moves_to_right_set(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    _photo(str(root / "Switch" / "By_Number" / "1-2" / "1.png"), _GREY)
+    _photo(str(root / "Switch" / "By_Number" / "1-2" / "2.png"), _BLUE)  # set 2's label in set 1's folder
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=_sticker_doc,
+                               by_color={_RED: ["S/N: SWQ00000001"], _BLUE: ["S/N: SWQ00000002"]})
+    assert _count_pictures(d.tables[0]) == 0 and _count_pictures(d.tables[1]) == 2
+
+
+def test_verify_mixed_folder_unread_follow_label_by_time(tmp_path, monkeypatch):
+    root = tmp_path / "photos"
+    shots = {"1.png": (_RED, 0), "2.png": (_GREEN, 5), "3.png": (_BLUE, 400), "4.png": (_GREY, 410)}
+    t = {}
+    for n, (c, ts) in shots.items():
+        t[_photo(str(root / "AAA1234567" / n), c)] = ts
+    monkeypatch.setattr(app, "photo_capture_time", lambda p: t.get(p))
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 2
+    assert any("mixed photos" in line and "[WARN]" in line for line in logs)
+
+
+def test_verify_lookalike_or_own_misread_never_moves(tmp_path, monkeypatch):
+    def doc3(path):
+        doc = Document()
+        for sn in ("AAA1234567", "BBB7654321", "BBB765432I"):   # last two differ by a look-alike (1 / I)
+            t = doc.add_table(rows=3, cols=2)
+            t.rows[0].cells[0].text = "Serial Number:"
+            t.rows[0].cells[1].text = sn
+            _merged_empty_row(t, 2)
+        doc.save(str(path))
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _RED)
+    _photo(str(root / "AAA1234567" / "2.png"), _BLUE)       # reads BBB7654321 exactly, but 'BBB765432I' exists
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=doc3)
+    assert _count_pictures(d.tables[0]) == 2 and _count_pictures(d.tables[1]) == 0
+    assert any("look-alike of BBB765432I" in line for line in logs)
+    ser = {"AAA123456B": "AAA123456B", "AAA1234568": "AAA1234568", "AAA123456X": "AAA123456X"}
+    assert app._move_read_doubt("AAA123456X", "AAA1234568", ser, "fuzzy0.3")   # likely own label misread
+    assert not app._move_read_doubt("AAA123456X", "AAA1234568", ser, "exact")
+    assert app._move_read_doubt("AAA123456B", "AAA123456X", ser, "exact")      # look-alike of ...68
