@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-11-17
+### Added
+- **Auto Mode (Auto-match S/N)**: New `auto_match` option in `run_injection()` and an **Auto-match S/N (scan whole table)** checkbox (on by default). Every cell of each table is scanned for a serial matching a photo folder name, so no keyword or S/N/Image cell setup is needed and documents with different table layouts work as-is.
+  - Serial matching ignores case, spaces and dashes (`wzp-301 000` = `WZP301000`), finds serials inside text (`S/N: WZP301000`) and in folder names with extra words (`Core2 10299X000016`); partial serials never match.
+  - The photo cell is detected per table: the first empty merged row below the S/N, else the empty row under a `รูป/ภาพ/Photo` label, else the configured Image cell only if it is empty. Otherwise the table is skipped and nothing is overwritten.
+  - Summary/list tables are skipped (more than one known serial, or 3+ serial-like values in the S/N column).
+  - The log shows `[FIND]` with the cells used per table and lists folders not found in the document.
+- **Nested Folder Scan** (`find_sn_leaf_folders()`): Auto mode finds image folders at any depth, e.g. `Model/By_SN/<serial>/`. Sequence folders like `195-280` are ignored and images placed directly in the selected folder are included.
+- **Read S/N from Photos (OCR)**: New `photo_ocr` option and a **Read S/N from photos (OCR)** checkbox. Photos in a folder that is not named by a serial (e.g. 200 timestamp-named photos in one folder) are OCR'd for the S/N on the box label and matched against the serials labelled in the document (`extract_doc_serials()`), allowing up to 2 OCR character errors when the match is unique. Photos are ordered by EXIF capture time, and each run of photos with no readable S/N (wide device shots) is split at its largest time gap, so it does not matter whether the label was shot before or after the device photos, even within one set (`photo_capture_time()`, `assign_unread_photos()`). Without EXIF times, file-name order is used and each serial is topped up to the usual photo count. Warnings flag unusual photo counts, non-adjacent repeats and photos with no serial.
+- **ชุดที่ (Set Number) Fallback**: New `set_number_fallback` option and a **Fallback: match ชุดที่ to folders like 12-280** checkbox (Auto mode, on by default in the GUI). Tables that still have no photos after S/N matching are filled from set-number folders (`Model/By_Number/12-280/`). The document's `ชุดที่ : N/T` rows are numbered continuously per Part Number across sections (e.g. 229 + 51 = 280), and model folders are matched to device groups by total and by name against the summary-table Description (`extract_set_entries()`, `find_set_number_folders()`, `map_set_folders_to_tables()`). Ambiguous folders are skipped and logged, never guessed. On the delivery document, the 104 `By_Number` folders gave exactly the same photos per table as the `By_SN` folders.
+- **Run summary report** (`<output>_summary.txt`, **📄 Summary** button, `SUMMARY` line in `--cli`): per device group of the document (Description + Part Number, total units) it lists units with photos, *partial* units (fewer photos than usual) and *missing* units with ชุดที่, S/N and the reason (no photo folder, photo folder is empty, no photo cell in the table, …). Then: S/N repeated in several document tables, photo folders not in the document, photos whose S/N could not be read, and all warnings/errors. One-row summary tables are not counted as extra devices.
+- **Command-line mode**: `app.py --cli` / `.exe --cli --docx ... --photos ... --out ... [--log ...]` runs Auto mode headless (batch jobs, testing the built exe).
+- **Shrink photos** checkbox / `max_image_px` (default 2000 px long side, ~360 dpi at 14 cm): much smaller and faster `.docx` files. `--original-size` or unticking keeps the original photos.
+- `test/test_auto_match.py` (23 tests).
+
+### Performance
+Full run on 669 photos / 336 tables (Smart Rotate on): **924 s → 257 s (3.6× faster)**, output **1.58 GB → 335 MB**.
+- python-docx re-hashed every existing image on each `add_picture()` (duplicate check), which is O(n²) and took 249 s. The SHA-1 is now cached per image part.
+- Each photo is decoded once, rotated in memory, shrunk and saved once (previously decoded and re-saved at full size 2–3 times).
+- Photos are prepared (HEIC, EXIF, Smart Rotate, resize) in a thread pool with one OCR engine per worker, while insertion into Word stays in document order.
+
+### Improved
+- **Set-number sticker on the box ('31/100')**: when no S/N label can be read, the sticker on the box is read and mapped to the document's `ชุดที่ 31/100` and from there to its S/N (`build_set_sticker_lookup()`, `serial_from_set_sticker()`, `_read_foreground_sticker()`). Totals follow the document's continuous numbering (e.g. `230/280` → section 2 `1/51`). Big bold serif digits are read by zooming into the sticker in 9 variants (height × horizontal squeeze), and a result needs ≥ 2 agreeing variants. Safeguards:
+  - only the **foreground** sticker counts (size × closeness to the photo centre), never boxes stacked behind (`271/280` behind `71/280`);
+  - ambiguous stickers are skipped (`1/2` when two device types have 2 units);
+  - a sticker read is ignored when photos shot within 90 s have a readable S/N label that disagrees; when both the S/N label and the sticker are read and disagree, the S/N label wins and the log warns (wrong sticker on a box).
+  On the 200-photo `all/all` set, stickers alone: 100 correct, 0 wrong. Combined: 200/200 photos grouped correctly, only 4 left to the time-gap rule (was 84).
+- **Small / far-away S/N labels**: if a photo gives no serial, each line that looks like `S/N …` or a serial is cropped and enlarged (text ~48 and ~72 px tall) and read again (`read_serial_from_photo()`). Fuzzy matching treats OCR look-alikes (O/0, 7/1, 8/B, 5/S, 6/G, 2/Z) as 1/3 of an error, accepts misread prefixes (`3/N`, `5/N`), and for 12+ character serials allows up to 2.5 errors only when the best match beats the next by ≥ 0.5. Example: a 991×742 photo of a TP-Link box (label text ~10 px) is now read as `33770F2001042`. On the 200-photo `all/all` set: 130 photos read (was 116), 0 wrong.
+
+### Fixed
+- **Same S/N in several document tables** (a copy error in the Word file): the photos were inserted into every one of those tables. Now they go only into the first table, the others fall through to the ชุดที่ fallback (their own set folder, i.e. the real box), and the log and summary report flag the document error.
+- OCR photo grouping: photos with no readable S/N are only attached to a device through a chain of shots ≤ 90 s apart. Before, photos of other devices with unreadable labels (e.g. servers) were pulled onto the nearest readable serial (11 photos landed on one switch). They are now left unassigned and listed in the log.
+- The "unusual photo count" warning ignores OCR groups that were discarded because an S/N folder exists.
+- README build command now bundles the OCR model and its runtime imports.
+- Serials starting with 3 digits (e.g. `21599990000GS0000208`) are no longer mistaken for camera folders like `100APPLE` in Auto mode.
+
 ## [1.5.0] - 2026-11-16
 ### Added
 - **Starting Page / Table Selection**: Added a 1-based **Start Table** selector in the main GUI (`start_table` in `run_injection()`) so users can skip cover, revision, and summary tables and begin photo injection at any table in the document.

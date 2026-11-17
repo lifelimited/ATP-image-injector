@@ -305,8 +305,8 @@ def test_dialog_preserves_selected_coordinates(tmp_path, headless_root):
     assert dlg.sn_rc == (5, 3)
     assert dlg.img_rc == (4, 2)
     # Check button highlight colors
-    assert dlg.buttons[(5, 3)].cget("bg") == "#00a8ff"
-    assert dlg.buttons[(4, 2)].cget("bg") == "#00b894"
+    assert dlg.buttons[(5, 3)].cget("bg") == app.UI_COLORS["select_sn"]
+    assert dlg.buttons[(4, 2)].cget("bg") == app.UI_COLORS["select_img"]
     dlg.destroy()
 
 

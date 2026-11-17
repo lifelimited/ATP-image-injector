@@ -1,5 +1,5 @@
 """
-Unit Test Image Injector v1.5.0 — Portable GUI App
+Unit Test Image Injector v1.6.0 — Portable GUI App
 ====================================================
 Inserts device photos from SN folders into the
 Unit Test Word document, matching by Serial Number.
@@ -8,6 +8,7 @@ Supports: .jpg .jpeg .png .bmp .tiff .heic .heif
 Auto-converts HEIC/HEIF (iPhone photos) to JPG.
 
 Changelog:
+  v1.6.0 — Auto mode: match S/N anywhere in tables, nested folders, OCR S/N from unsorted photos
   v1.5.0 — Starting table selection, arbitrary table layout picker, auto device model detection & filtering
   v1.4.0 — OCR engine upgraded to OpenThai2.0-OCR-Text (Thai+English, CPU-only)
   v1.3.1 — Fix image corruption in Word caused by missing DPI headers
@@ -21,7 +22,7 @@ Changelog:
 Usage: python app.py
 """
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 __app_name__ = "Unit Test Image Injector"
 
 import sys
@@ -119,6 +120,107 @@ def convert_heic_to_jpg(heic_path: str) -> str:
     img.convert('RGB').save(tmp_path, 'JPEG', quality=90, dpi=(72, 72))
     _temp_files.append(tmp_path)
     return tmp_path
+
+
+def _patch_docx_image_sha1_cache():
+    """
+    python-docx checks every existing image's SHA-1 on each add_picture() (duplicate check) and
+    recomputes the hash every time: O(n^2) hashing of all image bytes. Image parts never change,
+    so cache the hash per part. (On a 683-photo run this alone took 249 s.)
+    """
+    try:
+        from docx.parts.image import ImagePart
+    except Exception:
+        return
+    if getattr(ImagePart, "_sha1_cache_patched", False):
+        return
+    original = ImagePart.sha1
+
+    def sha1(self):
+        cached = self.__dict__.get("_cached_sha1")
+        if cached is None:
+            cached = original.fget(self)
+            self.__dict__["_cached_sha1"] = cached
+        return cached
+
+    ImagePart.sha1 = property(sha1)
+    ImagePart._sha1_cache_patched = True
+
+
+INSERT_MAX_PX = 2000  # long side of photos placed in Word (14 cm wide -> ~360 dpi); 0 = keep original
+_thread_local = threading.local()
+
+
+def _worker_ocr_engine():
+    """One OCR engine per worker thread (the shared engine runs one inference at a time)."""
+    eng = getattr(_thread_local, "ocr_engine", None)
+    if eng is None:
+        backend = (os.environ.get("OCR_BACKEND") or "openthai").lower()
+        if backend in ("openthai", "openthai2", "iapp"):
+            from ocr_engine import OpenThaiEngine
+            eng = OpenThaiEngine(threads=2)
+        else:
+            from ocr_engine import get_engine
+            eng = get_engine()
+        _thread_local.ocr_engine = eng
+    return eng
+
+
+def prepare_photo(img_path: str, auto_rotate: bool = True, smart_rotate: bool = False,
+                  max_px: int = INSERT_MAX_PX) -> tuple[str, list[str]]:
+    """
+    Make one photo ready for Word in a single decode: HEIC -> JPG, EXIF rotation,
+    Smart Rotate (OCR), shrink to max_px on the long side, save once as JPEG (dpi 72).
+    Safe to run in worker threads. Returns (path to insert, log notes).
+    The original file is returned untouched when nothing needs to change.
+    """
+    from PIL import Image as PILImage, ImageOps
+    notes: list[str] = []
+    src = img_path
+    if os.path.splitext(src)[1].lower() in ('.heic', '.heif'):
+        src = convert_heic_to_jpg(src)
+        notes.append(f"Converted {os.path.basename(img_path)} -> JPG")
+    if not (auto_rotate or smart_rotate or max_px):
+        return src, notes
+
+    with PILImage.open(src) as im:
+        orig_size = im.size
+        if max_px and im.format == "JPEG":
+            im.draft("RGB", (max_px, max_px))  # decode at 1/2, 1/4 ... size: much faster for big photos
+        orientation = im.getexif().get(0x0112, 1) if auto_rotate else 1
+        work = ImageOps.exif_transpose(im) if auto_rotate else None
+        work = (work if work is not None else im.copy()).convert("RGB")
+    exif_rotated = orientation not in (1, None)
+    if exif_rotated:
+        notes.append(f"Auto-rotated (EXIF) {os.path.basename(img_path)}")
+
+    angle = 0
+    if smart_rotate:
+        global _ocr_init_failed
+        if not _ocr_init_failed:
+            try:
+                from ocr_engine import detect_orientation
+                angle, score = detect_orientation(work, _worker_ocr_engine())
+                if score < 15:
+                    angle = 0
+            except Exception as e:
+                _ocr_init_failed = True
+                notes.append(f"[OCR Disabled] Could not run OCR: {e}")
+                angle = 0
+        if angle:
+            work = work.rotate(angle, expand=True)
+            notes.append(f"Smart-rotated (OCR) {angle}° for {os.path.basename(img_path)}")
+
+    too_big = bool(max_px) and max(orig_size) > max_px
+    if not (exif_rotated or angle or too_big or src != img_path):
+        return src, notes
+    if too_big and max(work.size) > max_px:
+        work.thumbnail((max_px, max_px), PILImage.LANCZOS)
+    fd, tmp_path = tempfile.mkstemp(suffix='.jpg', prefix='prep_')
+    os.close(fd)
+    work.save(tmp_path, 'JPEG', quality=88, dpi=(72, 72))
+    _temp_files.append(tmp_path)
+    return tmp_path, notes
 
 
 class InjectionResult(dict):
@@ -476,11 +578,1092 @@ def find_sn_folders(root: str, keyword: str = "", return_model_map: bool = False
     return res
 
 
+# ─────────────────────────────────────────────
+# Auto Mode: locate S/N + image cell anywhere in a table
+# ─────────────────────────────────────────────
+PHOTO_LABEL_REGEX = re.compile(r"(รูป|ภาพ|photo|picture|image)", re.IGNORECASE)
+_SN_SPLIT_REGEX = re.compile(r"[\s,;:|()\[\]{}<>\"'=]+")
+
+
+def normalize_sn(text) -> str:
+    """Uppercase and strip everything except A-Z / 0-9 (so 'wzp-301 000' == 'WZP301000')."""
+    return re.sub(r"[^0-9A-Z]", "", str(text or "").upper())
+
+
+def _is_sn_like(key: str, min_len: int) -> bool:
+    return len(key) >= min_len and any(ch.isdigit() for ch in key)
+
+
+SEQ_FOLDER_REGEX = re.compile(r"^\s*\d{1,4}\s*[-_/]\s*\d{1,4}\s*$")  # e.g. '195-280' (ชุดที่ 195/280)
+# Stricter than CAMERA_SUBDIR_REGEX so serials like '21599990000GS0000208' are not mistaken for '100APPLE'
+STRICT_CAMERA_DIR_REGEX = re.compile(r"^(?:dcim|camera|\d{3}[a-z_][a-z0-9_]{1,4})$", re.IGNORECASE)
+_SN_VALUE_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/_.]{5,}$")
+
+
+def find_sn_leaf_folders(root: str, log_cb=None) -> "SnFolderMap":
+    """
+    Auto-mode folder scan at any depth: every folder that directly holds images is a
+    candidate serial folder named after itself, e.g. root/Model/By_SN/<SN>/img.jpg.
+    - Camera subfolders (DCIM, 100APPLE, ...) take the name of their parent folder.
+    - Sequence-number folders like '195-280' are ignored (not serials).
+    - If the same name appears twice, the first folder (sorted path order) wins.
+    sn_to_model maps each serial to the top-level folder under root.
+    """
+    sn_map: dict[str, list[str]] = {}
+    sn_to_model: dict[str, str] = {}
+    if not root or not os.path.isdir(root):
+        return SnFolderMap(sn_map, sn_to_model=sn_to_model)
+    root_abs = os.path.abspath(root)
+    duplicates = []
+
+    for dirpath, dirnames, filenames in os.walk(root_abs):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(('.', '__')))
+        imgs = [os.path.join(dirpath, f) for f in sorted(filenames)
+                if '_converted' not in f and os.path.splitext(f)[1].lower() in VALID_IMG_EXTS]
+        if not imgs:
+            continue
+        rel_parts = os.path.relpath(dirpath, root_abs).split(os.sep)
+        if rel_parts == ['.']:
+            # images loose in the selected folder itself (named after it; resolved by OCR if not a serial)
+            rel_parts = [os.path.basename(root_abs) or root_abs]
+        parts = list(rel_parts)
+        while parts and STRICT_CAMERA_DIR_REGEX.match(parts[-1]):
+            parts.pop()
+        if not parts:
+            continue
+        name = parts[-1]
+        if SEQ_FOLDER_REGEX.match(name):
+            continue
+        if name in sn_map:
+            if os.path.dirname(sn_map[name][0]) != dirpath:
+                duplicates.append(name)
+            else:
+                sn_map[name].extend(imgs)
+            continue
+        sn_map[name] = imgs
+        sn_to_model[name] = parts[0] if len(parts) > 1 else os.path.basename(root_abs)
+
+    if duplicates and log_cb:
+        log_cb(f"  [WARN] {len(duplicates)} duplicate folder name(s), using first: "
+               + ", ".join(sorted(set(duplicates))[:5]))
+    return SnFolderMap(sn_map, sn_to_model=sn_to_model)
+
+
+def build_sn_index(sn_names) -> dict[str, str]:
+    """
+    Map normalized serial keys -> original folder name.
+    Full folder names are indexed first; then S/N-looking tokens inside folder names
+    (e.g. 'AP01 10299X000012' -> '10299X000012'). Keys claimed by >1 folder are dropped.
+    """
+    index: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def add(key, sn):
+        if key in index and index[key] != sn:
+            ambiguous.add(key)
+        else:
+            index[key] = sn
+
+    for sn in sn_names:
+        key = normalize_sn(sn)
+        if _is_sn_like(key, 5):
+            add(key, sn)
+    full_keys = set(index)
+    for sn in sn_names:
+        for tok in re.split(r"[\s_()\[\]]+", str(sn)):
+            key = normalize_sn(tok)
+            if key not in full_keys and _is_sn_like(key, 6):
+                add(key, sn)
+    for key in ambiguous:
+        index.pop(key, None)
+    return index
+
+
+def match_sns_in_text(text: str, sn_index: dict[str, str]) -> list[str]:
+    """Return folder names whose serial appears in a cell's text (whole cell or any token)."""
+    if not text or not text.strip():
+        return []
+    whole = normalize_sn(text)
+    if whole in sn_index:
+        return [sn_index[whole]]
+    found = []
+    for tok in _SN_SPLIT_REGEX.split(text):
+        key = normalize_sn(tok)
+        if key in sn_index and sn_index[key] not in found:
+            found.append(sn_index[key])
+    return found
+
+
+def _iter_unique_cells(table):
+    """Yield (row_idx, col_idx, cell) once per physical cell (merged cells reported once)."""
+    seen = []
+    for r_idx, row in enumerate(table.rows):
+        try:
+            cells = row.cells
+        except Exception:
+            continue
+        for c_idx, cell in enumerate(cells):
+            tc = cell._tc
+            if any(tc is s for s in seen):
+                continue
+            seen.append(tc)
+            yield r_idx, c_idx, cell
+
+
+def _cell_has_drawing(cell) -> bool:
+    try:
+        return bool(cell._tc.xpath('.//*[local-name()="drawing" or local-name()="pict"]'))
+    except Exception:
+        return False
+
+
+def detect_image_cell(table, sn_row: int, fallback_rc: tuple | None = None):
+    """
+    Guess the photo cell of a table, searching below the S/N row:
+      1. first text-empty row merged into ONE cell (or already holding a picture)
+      2. first text-empty row right after a short 'รูป/ภาพ/Photo/Picture' label row
+      3. fallback_rc, only if that cell exists and is text-empty
+    Returns ((row, col), reason) or (None, reason).
+    """
+    rows = {}
+    for r, c, cell in _iter_unique_cells(table):
+        rows.setdefault(r, []).append((c, cell))
+
+    def row_empty(r):
+        return r in rows and all(not cell.text.strip() for _, cell in rows[r])
+
+    later = sorted(r for r in rows if r > sn_row)
+
+    for r in later:
+        if row_empty(r) and (len(rows[r]) == 1 or any(_cell_has_drawing(cell) for _, cell in rows[r])):
+            return (r, rows[r][0][0]), "empty merged row"
+
+    for r in later:
+        label = " ".join(cell.text.strip() for _, cell in rows[r]).strip()
+        if label and len(label) <= 40 and PHOTO_LABEL_REGEX.search(label) and row_empty(r + 1):
+            return (r + 1, rows[r + 1][0][0]), f"below label '{label}'"
+
+    if fallback_rc is not None:
+        try:
+            cell = table.rows[fallback_rc[0]].cells[fallback_rc[1]]
+            if not cell.text.strip():
+                return tuple(fallback_rc), "configured layout"
+        except (IndexError, AttributeError, TypeError):
+            pass
+    return None, "no empty photo cell found"
+
+
+def auto_locate_in_table(table, sn_index: dict[str, str], fallback_img_rc: tuple | None = None) -> dict | None:
+    """
+    Scan every cell of a table for a known folder serial.
+    Returns None if no serial is found, otherwise a dict with:
+      status: 'ok' | 'ambiguous' | 'no_image_cell'
+      sn, sn_rc, img_rc, reason (for 'ok'); sns (for 'ambiguous')
+    """
+    matches: dict[str, tuple] = {}
+    for r, c, cell in _iter_unique_cells(table):
+        for sn in match_sns_in_text(cell.text, sn_index):
+            matches.setdefault(sn, (r, c))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        return {"status": "ambiguous", "sns": sorted(matches)}
+    sn, sn_rc = next(iter(matches.items()))
+    # A list/summary table has many other serial-like values in the same column
+    siblings = 0
+    for r, c, cell in _iter_unique_cells(table):
+        if c == sn_rc[1] and r != sn_rc[0]:
+            txt = cell.text.strip()
+            if _SN_VALUE_REGEX.match(txt) and any(ch.isdigit() for ch in txt):
+                siblings += 1
+    if siblings >= 3:
+        return {"status": "ambiguous", "sns": [sn], "list_rows": siblings + 1}
+    img_rc, reason = detect_image_cell(table, sn_rc[0], fallback_img_rc)
+    if img_rc is None:
+        return {"status": "no_image_cell", "sn": sn, "sn_rc": sn_rc, "reason": reason}
+    return {"status": "ok", "sn": sn, "sn_rc": sn_rc, "img_rc": img_rc, "reason": reason}
+
+
+# ─────────────────────────────────────────────
+# Auto Mode + OCR: photos not sorted into S/N folders
+# ─────────────────────────────────────────────
+SERIAL_LABEL_REGEX = re.compile(r"^\s*(?:serial\s*(?:no\.?|number)?|s\s*/\s*n)\s*[:.]?\s*$", re.IGNORECASE)
+SERIAL_INLINE_REGEX = re.compile(r"^\s*(?:serial\s*(?:no\.?|number)?|s\s*/\s*n)\s*[:.]\s*(\S+)\s*$", re.IGNORECASE)
+# 'S/N' as printed, plus common OCR misreads of the S ('5/N', '3/N', '$N'), only at a word start
+_OCR_SN_PREFIX_REGEX = re.compile(r"(?<![A-Za-z0-9])[S5$3]\s*[/|]?\s*N\W*(.+)$", re.IGNORECASE)
+
+
+def extract_doc_serials(doc) -> dict[str, str]:
+    """
+    Serial numbers written in the document, found by their label:
+      'Serial Number:' | <value>   (label cell, value in the next cell)
+      'S/N: <value>'               (label and value in one cell)
+      header 'Serial Number' column -> values in the rows below
+    Returns {normalized: original text}.
+    """
+    out: dict[str, str] = {}
+
+    def add(val):
+        key = normalize_sn(val)
+        if _is_sn_like(key, 6):
+            out.setdefault(key, val.strip())
+
+    for table in doc.tables:
+        rows: dict[int, list] = {}
+        for r, c, cell in _iter_unique_cells(table):
+            rows.setdefault(r, []).append((c, cell.text.strip()))
+        header_cols = set()
+        for r in sorted(rows):
+            cells = rows[r]
+            for i, (c, txt) in enumerate(cells):
+                if SERIAL_LABEL_REGEX.match(txt):
+                    header_cols.add(c)
+                    if i + 1 < len(cells) and cells[i + 1][1]:
+                        add(cells[i + 1][1])
+                    continue
+                m = SERIAL_INLINE_REGEX.match(txt)
+                if m:
+                    add(m.group(1))
+                elif c in header_cols and txt and _SN_VALUE_REGEX.match(txt):
+                    add(txt)
+    return out
+
+
+# Characters OCR typically confuses on labels; swapping within a group costs 1/3 of an edit.
+_OCR_CONFUSABLE_GROUPS = ("O0DQ", "I1L7T", "S5", "B8", "Z2", "G6", "UV")
+_OCR_CONFUSABLE = {(a, b) for g in _OCR_CONFUSABLE_GROUPS for a in g for b in g if a != b}
+_CONFUSABLE_COST = 1 / 3
+
+
+def _levenshtein(a: str, b: str, max_dist: float = 2.0) -> float:
+    """Edit distance where OCR look-alike substitutions (O/0, 7/1, 8/B, ...) cost 1/3."""
+    if abs(len(a) - len(b)) > max_dist:
+        return max_dist + 1
+    prev = [float(j) for j in range(len(b) + 1)]
+    for i, ca in enumerate(a, 1):
+        cur = [float(i)]
+        for j, cb in enumerate(b, 1):
+            if ca == cb:
+                sub = 0.0
+            elif (ca, cb) in _OCR_CONFUSABLE:
+                sub = _CONFUSABLE_COST
+            else:
+                sub = 1.0
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + sub))
+        if min(cur) > max_dist:
+            return max_dist + 1
+        prev = cur
+    return prev[-1]
+
+
+def find_serial_in_ocr_lines(lines: list[str], doc_serials: dict[str, str]) -> tuple[str | None, str]:
+    """
+    Pick the document serial printed in a photo from its OCR lines.
+    Exact match first (text after 'S/N' preferred), then a unique near match
+    (distance <= 2, look-alike characters cheap, serials of 10+ chars) to absorb OCR mistakes.
+    Returns (normalized serial or None, 'exact' | 'fuzzyN.N' | '').
+    """
+    cands = []
+    for text in lines:
+        m = _OCR_SN_PREFIX_REGEX.search(text)
+        if m:
+            cands.insert(0, normalize_sn(m.group(1)))
+        cands.append(normalize_sn(text))
+        cands += [normalize_sn(t) for t in _SN_SPLIT_REGEX.split(text)]
+    cands = [c for c in dict.fromkeys(cands) if len(c) >= 6]
+    for c in cands:
+        if c in doc_serials:
+            return c, "exact"
+    best: dict[str, float] = {}
+    for c in cands:
+        if len(c) < 10:
+            continue
+        for s in doc_serials:
+            if len(s) < 10:
+                continue
+            limit = 2.5 if len(s) >= 12 else 2.0
+            d = _levenshtein(c, s, max_dist=3.0)
+            if d <= limit and d < best.get(s, 99):
+                best[s] = d
+    if best:
+        ranked = sorted(best.items(), key=lambda kv: kv[1])
+        # must clearly beat the next candidate (sibling serials like ...042 / ...073 stay apart)
+        margin = 0.5 if ranked[0][1] > 2.0 else 1e-9
+        if len(ranked) == 1 or ranked[0][1] < ranked[1][1] - margin:
+            return ranked[0][0], f"fuzzy{ranked[0][1]:.1f}"
+    return None, ""
+
+
+def _load_photo_for_ocr(img_path: str):
+    from PIL import Image as PILImage, ImageOps
+    with PILImage.open(img_path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((4096, 4096))
+    return img
+
+
+def _ocr_image_lines(img_path: str, engine) -> list[str]:
+    return engine.read(_load_photo_for_ocr(img_path)).texts(include_dropped=True)
+
+
+def _serial_like_line(text: str) -> bool:
+    if _OCR_SN_PREFIX_REGEX.search(text):
+        return True
+    return any(len(normalize_sn(t)) >= 8 and any(ch.isdigit() for ch in t) for t in _SN_SPLIT_REGEX.split(text))
+
+
+_STICKER_REGEX = re.compile(r"(?<![\d/])(\d{1,4})\s*/\s*(\d{1,4})(?![\d/])")
+# look-alikes seen when OCR reads big serif sticker digits (Thai ด/ต/ฉ for a wide 0)
+_STICKER_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "ด": "0", "ต": "0", "ฉ": "0",
+                              "I": "1", "l": "1", "|": "1"})
+
+
+def build_set_sticker_lookup(entries: list[dict]) -> dict[int, list[dict]]:
+    """
+    For set-number stickers on boxes ('31/100'): {total: [ {n: doc entry}, ... ]}.
+    A device group is listed under its whole total (numbered across sections, e.g. 1..280)
+    and, when it is split into sections, under each section's own total (e.g. 1..51).
+    """
+    groups: dict[str, dict] = {}
+    for e in entries:
+        g = groups.setdefault(e["group"], {"total": e["group_total"], "by_index": {}, "by_section": {}})
+        g["by_index"][e["index"]] = e
+        g["by_section"].setdefault(e["total"], {}).setdefault(e["n"], []).append(e)
+    lookup: dict[int, list[dict]] = {}
+    for g in groups.values():
+        lookup.setdefault(g["total"], []).append(g["by_index"])
+        for sec_total, by_n in g["by_section"].items():
+            if sec_total != g["total"] and len(by_n) == sec_total and all(len(v) == 1 for v in by_n.values()):
+                lookup.setdefault(sec_total, []).append({n: v[0] for n, v in by_n.items()})
+    return lookup
+
+
+def serial_from_set_sticker(lines: list[str], lookup: dict[int, list[dict]],
+                            doc_serials: dict[str, str]) -> tuple[str | None, str]:
+    """
+    Read a set-number sticker like '31/100' (a line that is just 'N/T') and return the serial of
+    the document table 'ชุดที่ N/T'. Only answers when exactly one device fits (e.g. '1/2' with two
+    2-unit device groups is ambiguous -> None).
+    Returns (normalized serial or None, 'N/T').
+    """
+    hits: dict[str, str] = {}
+    for text in lines:
+        fixed = text.strip().translate(_STICKER_FIX)
+        for m in _STICKER_REGEX.finditer(fixed):
+            if len(fixed.replace(" ", "")) > len(m.group(0).replace(" ", "")) + 3:
+                continue  # part of a longer text, not a sticker
+            n, total = int(m.group(1)), int(m.group(2))
+            if not 1 <= n <= total:
+                continue
+            for mapping in lookup.get(total, []):
+                e = mapping.get(n)
+                key = normalize_sn(e.get("sn")) if e else ""
+                if key and key in doc_serials:
+                    hits.setdefault(key, f"{n}/{total}")
+    if len(hits) == 1:
+        return next(iter(hits.items()))
+    return None, ""
+
+
+def read_serial_from_photo(img_path: str, engine, doc_serials: dict[str, str],
+                           max_zoom_lines: int = 6,
+                           sticker_lookup: dict[int, list[dict]] | None = None) -> tuple[str | None, str]:
+    """
+    OCR a photo for a document serial:
+      1. the S/N label (whole photo; if none, each 'S/N'/serial-looking line is cropped and
+         enlarged to ~48/72 px text and read again),
+      2. else a set-number sticker on the box ('31/100' -> document 'ชุดที่ 31/100' -> its S/N).
+    When both are readable and disagree, the S/N wins and 'how' notes the sticker mismatch.
+    Returns (normalized serial or None, how): 'exact' / 'fuzzyN.N' (+'+zoom') / 'sticker N/T'.
+    """
+    from PIL import Image as PILImage
+    img = _load_photo_for_ocr(img_path)
+    res = engine.read(img)
+    texts = res.texts(include_dropped=True)
+    sticker_key, sticker_label = (_read_foreground_sticker(img, res, engine, sticker_lookup, doc_serials,
+                                                           allow_zoom=False)
+                                  if sticker_lookup else (None, ""))
+    key, how = find_serial_in_ocr_lines(texts, doc_serials)
+
+    if not key:
+        lines = [ln for ln in getattr(res, "lines", []) if getattr(ln, "box", None) and _serial_like_line(ln.text)]
+        lines.sort(key=lambda ln: 0 if _OCR_SN_PREFIX_REGEX.search(ln.text) else 1)
+        for ln in lines[:max_zoom_lines]:
+            xs = [pt[0] for pt in ln.box]
+            ys = [pt[1] for pt in ln.box]
+            h = max(ys) - min(ys)
+            if h <= 0:
+                continue
+            crop = img.crop((int(max(0, min(xs) - 2 * h)), int(max(0, min(ys) - 1.5 * h)),
+                             int(min(img.width, max(xs) + 2 * h)), int(min(img.height, max(ys) + 1.5 * h))))
+            tried = set()
+            for target_px in (48.0, 72.0):
+                scale = round(min(8.0, max(2.0, target_px / h)), 1)
+                if scale in tried:
+                    continue
+                tried.add(scale)
+                big = crop.resize((max(1, int(crop.width * scale)), max(1, int(crop.height * scale))),
+                                  PILImage.LANCZOS)
+                key, how = find_serial_in_ocr_lines(engine.read(big).texts(include_dropped=True), doc_serials)
+                if key:
+                    how += "+zoom"
+                    break
+            if key:
+                break
+
+    if key:
+        if sticker_key and sticker_key != key:
+            how += f" [sticker {sticker_label} says {doc_serials[sticker_key]}]"
+        return key, how
+    if sticker_key:
+        return sticker_key, f"sticker {sticker_label}"
+    if sticker_lookup:
+        sticker_key, sticker_label = _read_foreground_sticker(img, res, engine, sticker_lookup, doc_serials)
+        if sticker_key:
+            return sticker_key, f"sticker {sticker_label}"
+    return None, ""
+
+
+def _foreground_sticker_line(img, res):
+    """
+    The set-number sticker of the box being photographed: among short OCR lines containing '/',
+    the one with the best size x closeness-to-centre score. Boxes stacked in the background carry
+    stickers near the photo edges ('271/280' behind '71/280'); they must never decide.
+    """
+    best, best_score = None, 0.0
+    cx, cy = img.width / 2, img.height / 2
+    for ln in getattr(res, "lines", []):
+        box = getattr(ln, "box", None)
+        text = ln.text.strip()
+        # digits not required: big serif stickers are sometimes read as e.g. '/Y Y'
+        if not box or "/" not in text or len(text) > 12:
+            continue
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        h = max(ys) - min(ys)
+        mx, my = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        dist = (((mx - cx) / cx) ** 2 + ((my - cy) / cy) ** 2) ** 0.5   # 0 centre .. ~1.4 corner
+        touches_edge = min(xs) < 0.01 * img.width or max(xs) > 0.99 * img.width
+        score = h * max(0.05, 1.0 - 0.8 * dist) * (0.3 if touches_edge else 1.0)
+        if score > best_score:
+            best, best_score = ln, score
+    return best
+
+
+def _read_foreground_sticker(img, res, engine, sticker_lookup, doc_serials, allow_zoom=True):
+    """
+    Read only the foreground sticker: its OCR text first; if that is not a usable 'N/T', crop it
+    and read 9 variants (text height 40/48/56 px x width squeezed to 50/60/70%) - big bold serif
+    digits are hard for the OCR model as photographed. A zoomed result needs >= 2 agreeing
+    variants and no tie. Without boxes (simple engines) the plain text lines are used.
+    Returns (normalized serial or None, 'N/T' or 'N/T+zoom').
+    """
+    from PIL import Image as PILImage, ImageOps
+    from collections import Counter
+    ln = _foreground_sticker_line(img, res)
+    if ln is None:
+        if getattr(res, "lines", None):
+            return None, ""
+        return serial_from_set_sticker(res.texts(include_dropped=True), sticker_lookup, doc_serials)
+    key, label = serial_from_set_sticker([ln.text], sticker_lookup, doc_serials)
+    if key or not allow_zoom:
+        return key, label
+
+    xs = [p[0] for p in ln.box]
+    ys = [p[1] for p in ln.box]
+    h = max(ys) - min(ys)
+    if h < 6:
+        return None, ""
+    crop = img.crop((int(max(0, min(xs) - 1.5 * h)), int(max(0, min(ys) - 0.5 * h)),
+                     int(min(img.width, max(xs) + 1.5 * h)), int(min(img.height, max(ys) + 0.5 * h))))
+    gray = ImageOps.autocontrast(crop.convert("L"))
+    votes: Counter = Counter()
+    labels = {}
+    for target in (40.0, 48.0, 56.0):
+        k = target / h
+        for squeeze in (0.5, 0.6, 0.7):
+            v = gray.resize((max(1, int(gray.width * k * squeeze)), max(1, int(gray.height * k))),
+                            PILImage.LANCZOS)
+            v = ImageOps.expand(v.convert("RGB"), border=24, fill="white")
+            vk, vl = serial_from_set_sticker(engine.read(v).texts(include_dropped=True),
+                                             sticker_lookup, doc_serials)
+            if vk:
+                votes[vk] += 1
+                labels[vk] = vl
+    if votes:
+        ranked = votes.most_common(2)
+        if ranked[0][1] >= 2 and (len(ranked) == 1 or ranked[0][1] > ranked[1][1]):
+            return ranked[0][0], labels[ranked[0][0]] + "+zoom"
+    return None, ""
+
+
+def photo_capture_time(img_path: str) -> float | None:
+    """Capture time from EXIF (DateTimeOriginal + sub-seconds, else DateTime), or None."""
+    from datetime import datetime
+    from PIL import Image as PILImage
+    try:
+        with PILImage.open(img_path) as img:
+            exif = img.getexif()
+            sub = exif.get_ifd(0x8769)
+            raw = sub.get(36867) or exif.get(306)
+            subsec = sub.get(37521) or sub.get(37520) or ""
+        if not raw:
+            return None
+        t = datetime.strptime(str(raw).strip("\x00 ")[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+        digits = "".join(ch for ch in str(subsec) if ch.isdigit())
+        return t + (float("0." + digits) if digits else 0.0)
+    except Exception:
+        return None
+
+
+UNREAD_MAX_GAP_S = 90.0  # an unread photo must be shot within this many seconds of its device's chain
+
+
+def assign_unread_photos(seq: list[tuple[str, str | None]], times: list[float] | None = None,
+                         max_gap: float = UNREAD_MAX_GAP_S) -> tuple[dict, str]:
+    """
+    seq: photos in shooting order as (path, serial-or-None). Each run of unread photos
+    lying between serial A and serial B is split between them:
+      - with capture times: at the largest time gap (a device's photos are taken close together),
+        so it works whether the label photo was shot before or after the device photos.
+        A photo is only attached through a chain of gaps <= max_gap; photos shot long before/after
+        any readable label (e.g. another device whose label can't be read) stay unassigned;
+      - without times: each serial is filled up to the usual photo count (A first, then B);
+        photos beyond that stay unassigned.
+    Returns ({serial: [paths in shooting order], None: [unassigned paths]}, method).
+    """
+    n = len(seq)
+    owner: list = [k for _, k in seq]
+    read_idx = [i for i, k in enumerate(owner) if k]
+    if not read_idx:
+        return ({None: [p for p, _ in seq]} if seq else {}), "none"
+    typical = max(1, round(n / len({owner[i] for i in read_idx})))
+    method = "time gap" if times else "photo count"
+
+    runs = []
+    i = 0
+    while i < n:
+        if owner[i] is None:
+            j = i
+            while j < n and owner[j] is None:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    for i, j in runs:
+        a = owner[i - 1] if i > 0 else None
+        b = owner[j] if j < n else None
+        k = j - i
+        if a is None:
+            split = 0
+        elif b is None or b == a:
+            split = k
+        elif times:
+            gaps = [times[x + 1] - times[x] for x in range(i - 1, j)]  # k+1 gaps
+            split = max(range(k + 1), key=lambda g: (gaps[g], -g))
+        else:
+            split = k
+        left, right = list(range(i, i + split)), list(range(i + split, j))
+
+        if times:
+            keep_left, prev = [], i - 1
+            for x in left:
+                if times[x] - times[prev] > max_gap:
+                    break
+                keep_left.append(x)
+                prev = x
+            keep_right, nxt = [], j
+            for x in reversed(right):
+                if times[nxt] - times[x] > max_gap:
+                    break
+                keep_right.append(x)
+                nxt = x
+        else:
+            if a is not None and b is not None and b != a:
+                have_a = sum(1 for x in range(i) if owner[x] == a)
+                split = min(k, max(0, typical - have_a))
+                left, right = list(range(i, i + split)), list(range(i + split, j))
+            elif a is not None:
+                have_a = sum(1 for x in range(i) if owner[x] == a)
+                if b != a:
+                    left = left[:max(0, typical - have_a)]
+            keep_left = left
+            keep_right = []
+            if b is not None and b != a:
+                b_reads = 0
+                x = j
+                while x < n and owner[x] == b:
+                    b_reads += 1
+                    x += 1
+                cap = max(0, typical - b_reads)
+                keep_right = right[len(right) - cap:] if cap else []
+
+        for x in keep_left:
+            owner[x] = a
+        for x in keep_right:
+            owner[x] = b
+
+    groups: dict = {}
+    for (path, _), k in zip(seq, owner):
+        groups.setdefault(k, []).append(path)
+    return groups, method
+
+
+def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=None,
+                        log_cb=None, cancel_event=None, time_fn=None,
+                        sticker_lookup: dict[int, list[dict]] | None = None
+                        ) -> tuple[dict[str, list[str]], list[str]]:
+    """
+    OCR each photo for a document serial, then group the photos per serial.
+    Photos are put in shooting order (EXIF capture time when every photo has one, else
+    file-name order); photos with no readable serial (e.g. wide shots of the device) are
+    given to the serial shot closest to them (see assign_unread_photos).
+    Returns ({original serial: [image paths]}, [unassigned image paths]).
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    if engine is None:
+        from ocr_engine import get_engine
+        engine = get_engine(log_cb=log_cb)
+    time_fn = time_fn or photo_capture_time
+
+    reads: list[tuple[str, str | None]] = []
+    sticker_reads: dict[str, str] = {}  # path -> 'N/T' for photos identified only by a set sticker
+    total = len(images)
+    for i, path in enumerate(images, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        try:
+            key, how = read_serial_from_photo(path, engine, doc_serials, sticker_lookup=sticker_lookup)
+        except Exception as e:
+            key, how = None, ""
+            log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
+        reads.append((path, key))
+        if key and how.startswith("sticker"):
+            sticker_reads[path] = how.split()[1].replace("+zoom", "")
+        if key and "[sticker" in how:
+            log(f"    [WARN] {os.path.basename(path)}: label S/N {doc_serials[key]} but {how.split('[', 1)[1].rstrip(']')}"
+                " - check the sticker (S/N label used)")
+        elif key and how != "exact":
+            log(f"      [OCR ] {os.path.basename(path)} -> {doc_serials[key]} ({how})")
+        if i % 20 == 0 or i == total:
+            log(f"    OCR {i}/{total} photo(s)...")
+
+    # Shooting order
+    stamps = [time_fn(p) for p, _ in reads]
+    times = None
+    if reads and all(t is not None for t in stamps):
+        order = sorted(range(len(reads)), key=lambda i: (stamps[i], os.path.basename(reads[i][0])))
+        reads = [reads[i] for i in order]
+        times = [stamps[i] for i in order]
+        log("    Shooting order: EXIF capture time")
+    else:
+        missing = sum(1 for t in stamps if t is None)
+        if reads:
+            log(f"    Shooting order: file name ({missing} photo(s) without EXIF time)")
+
+    # A sticker read is weaker than an S/N label: if photos shot close by (within the 90 s chain)
+    # have readable S/N labels, the sticker must agree with one of them, else it is ignored.
+    if sticker_reads:
+        keys = [k for _, k in reads]
+        dropped = 0
+        for i, (path, k) in enumerate(reads):
+            if path not in sticker_reads or not k:
+                continue
+            strong = set()
+            for step in (-1, 1):
+                j = i
+                while 0 <= j + step < len(reads):
+                    nj = j + step
+                    if times is not None and abs(times[nj] - times[j]) > UNREAD_MAX_GAP_S:
+                        break
+                    if keys[nj] and reads[nj][0] not in sticker_reads:
+                        strong.add(keys[nj])
+                        break
+                    j = nj
+            if strong and k not in strong:
+                reads[i] = (path, None)
+                dropped += 1
+                log(f"      [OCR ] {os.path.basename(path)}: sticker {sticker_reads[path]} ignored "
+                    f"(nearby label S/N {', '.join(doc_serials[s] for s in sorted(strong))})")
+        used = len(sticker_reads) - dropped
+        log(f"    {used} photo(s) identified by set-number sticker"
+            + (f", {dropped} sticker read(s) ignored (disagree with nearby S/N labels)" if dropped else ""))
+
+    groups, method = assign_unread_photos(reads, times)
+    unassigned = groups.pop(None, [])
+    n_unread = sum(1 for _, k in reads if not k)
+    if n_unread - len(unassigned) > 0:
+        log(f"    {n_unread - len(unassigned)} photo(s) without readable S/N assigned by {method}")
+
+    # Same serial read in two separate places of the sequence -> warn (photos still grouped)
+    seen_runs = []
+    last = None
+    for _, key in reads:
+        if key and key != last:
+            seen_runs.append(key)
+            last = key
+    repeated = sorted({k for k in seen_runs if seen_runs.count(k) > 1})
+    if repeated:
+        log(f"    [WARN] serial read in non-adjacent photos, please check: "
+            + ", ".join(doc_serials[k] for k in repeated[:5]))
+
+    return {doc_serials[k]: v for k, v in groups.items()}, unassigned
+
+
+# ─────────────────────────────────────────────
+# Auto Mode fallback: set-number folders ('ชุดที่ 12/280' <-> folder '12-280')
+# ─────────────────────────────────────────────
+SET_LABEL_REGEX = re.compile(r"^\s*(?:ชุด\s*ที่|set\s*(?:no\.?)?|unit\s*(?:no\.?)?)\s*[:.]?\s*$", re.IGNORECASE)
+SET_VALUE_REGEX = re.compile(r"^\s*(\d{1,4})\s*/\s*(\d{1,4})\s*$")
+PN_LABEL_REGEX = re.compile(r"^\s*(?:part\s*(?:number|no\.?)|p\s*/\s*n)\s*[:.]?\s*$", re.IGNORECASE)
+ITEM_LABEL_REGEX = re.compile(r"^\s*(?:รายการ|item|description|model)\s*[:.]?\s*$", re.IGNORECASE)
+GENERIC_FOLDER_REGEX = re.compile(r"^(?:by[\s_-]*(?:number|num|no|sn|serial)|numbers?|no|sn|serials?)$", re.IGNORECASE)
+
+
+def extract_set_entries(doc) -> list[dict]:
+    """
+    One entry per detail table that has a 'ชุดที่ : N/T' row:
+      {t_idx, n, total, pn, item, sn, last_row, group, index, group_total}
+    Tables of the same Part Number (else same รายการ) form one device group. When a group is
+    split over several sections (e.g. 1/229 ... 229/229 then 1/51 ... 51/51 of the same PN),
+    'index' numbers it continuously in document order (1..280) and group_total is the sum.
+    """
+    entries = []
+    for t_idx, table in enumerate(doc.tables, start=1):
+        rows: dict[int, list] = {}
+        for r, c, cell in _iter_unique_cells(table):
+            rows.setdefault(r, []).append((c, cell.text.strip()))
+        info: dict = {}
+        for r in sorted(rows):
+            cells = rows[r]
+            for i in range(len(cells) - 1):
+                label, value = cells[i][1], cells[i + 1][1]
+                if not value:
+                    continue
+                m = SET_VALUE_REGEX.match(value)
+                if SET_LABEL_REGEX.match(label) and m and "n" not in info:
+                    info.update(n=int(m.group(1)), total=int(m.group(2)))
+                elif PN_LABEL_REGEX.match(label):
+                    info.setdefault("pn", value)
+                elif ITEM_LABEL_REGEX.match(label):
+                    info.setdefault("item", value)
+                elif SERIAL_LABEL_REGEX.match(label):
+                    info.setdefault("sn", value)
+                else:
+                    continue
+                info["last_row"] = max(info.get("last_row", 0), r)
+        if "n" in info and 1 <= info["n"] <= info["total"]:
+            info["t_idx"] = t_idx
+            entries.append(info)
+
+    # Continuous numbering per device group
+    segments: dict[str, list] = {}
+    for e in entries:
+        e["group"] = normalize_sn(e.get("pn")) or e.get("item", "").strip() or "?"
+        seg = (e.get("item", ""), e["total"])
+        segs = segments.setdefault(e["group"], [])
+        if seg not in segs:
+            segs.append(seg)
+    for e in entries:
+        segs = segments[e["group"]]
+        seg_i = segs.index((e.get("item", ""), e["total"]))
+        e["index"] = sum(t for _, t in segs[:seg_i]) + e["n"]
+        e["group_total"] = sum(t for _, t in segs)
+    return entries
+
+
+def find_set_number_folders(root: str) -> list[dict]:
+    """
+    Folders named like '12-280' (set 12 of 280) that hold images, at any depth.
+    model = nearest parent folder that is not a generic container ('By_Number', 'SN', ...).
+    Returns [{model, n, total, name, imgs}].
+    """
+    out = []
+    if not root or not os.path.isdir(root):
+        return out
+    root_abs = os.path.abspath(root)
+    root_name = os.path.basename(root_abs)
+    for dirpath, dirnames, filenames in os.walk(root_abs):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(('.', '__')))
+        imgs = [os.path.join(dirpath, f) for f in sorted(filenames)
+                if '_converted' not in f and os.path.splitext(f)[1].lower() in VALID_IMG_EXTS]
+        if not imgs:
+            continue
+        rel = os.path.relpath(dirpath, root_abs)
+        parts = [] if rel == "." else rel.split(os.sep)
+        while parts and STRICT_CAMERA_DIR_REGEX.match(parts[-1]):
+            parts.pop()
+        if not parts:
+            continue
+        m = re.match(r"^\s*(\d{1,4})\s*[-_/]\s*(\d{1,4})\s*$", parts[-1])
+        if not m:
+            continue
+        n, total = int(m.group(1)), int(m.group(2))
+        if not (1 <= n <= total):
+            continue
+        ancestors = [p for p in reversed(parts[:-1]) if not GENERIC_FOLDER_REGEX.match(p)]
+        model = ancestors[0] if ancestors else root_name
+        out.append({"model": model, "n": n, "total": total, "name": parts[-1], "imgs": imgs})
+    return out
+
+
+def _name_similarity(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    na, nb = normalize_sn(a), normalize_sn(b)
+    if not na or not nb:
+        return 0.0
+    if model_matches(a, b):
+        return 1.0
+    return SequenceMatcher(None, na, nb).ratio()
+
+
+def map_set_folders_to_tables(set_folders: list[dict], entries: list[dict],
+                              pn_to_desc: dict[str, str] | None = None, log_cb=None) -> dict[int, dict]:
+    """
+    Decide which device group each model folder belongs to, then map every set folder to a table.
+    A group fits a folder when its total matches (whole group, or one section of it) and its
+    name (summary-table Description, else รายการ) resembles the folder's model name.
+    If names give no answer, a total that fits exactly one group is accepted; anything else is skipped.
+    Returns {t_idx: {folder entry + 'entry': doc entry, 'how': str}}.
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    pn_to_desc = pn_to_desc or {}
+    groups: dict[str, dict] = {}
+    for e in entries:
+        g = groups.setdefault(e["group"], {"total": e["group_total"], "sections": set(),
+                                           "names": set(), "by_index": {}, "by_section": {}})
+        g["sections"].add(e["total"])
+        if e.get("pn") and e["pn"] in pn_to_desc:
+            g["names"].add(pn_to_desc[e["pn"]])
+        if e.get("item"):
+            g["names"].add(e["item"])
+        g["by_index"][e["index"]] = e
+        g["by_section"].setdefault(e["total"], {}).setdefault(e["n"], []).append(e)
+
+    result: dict[int, dict] = {}
+    by_model: dict[tuple, list] = {}
+    for f in set_folders:
+        by_model.setdefault((f["model"], f["total"]), []).append(f)
+
+    for (model, total), folders in sorted(by_model.items()):
+        fits = []
+        for key, g in groups.items():
+            if g["total"] == total:
+                mode = "whole"
+            elif total in g["sections"] and len(g["by_section"][total]) == total \
+                    and all(len(v) == 1 for v in g["by_section"][total].values()):
+                mode = "section"
+            else:
+                continue
+            sim = max((_name_similarity(model, nm) for nm in g["names"]), default=0.0)
+            fits.append((sim, key, mode))
+        fits.sort(reverse=True)
+        chosen, how = None, ""
+        if fits and fits[0][0] >= 0.8 and (len(fits) == 1 or fits[1][0] < fits[0][0]):
+            chosen, how = fits[0], f"name ~ {max(groups[fits[0][1]]['names'], key=lambda nm: _name_similarity(model, nm))}"
+        elif len(fits) == 1:
+            chosen, how = fits[0], "only group with this total"
+        if not chosen:
+            why = "no device group with this total" if not fits else f"{len(fits)} possible device groups"
+            log(f"  [SKIP] set folders '{model}' (x/{total}, {len(folders)} folder(s)): {why}")
+            continue
+        _, key, mode = chosen
+        g = groups[key]
+        log(f"  [SET ] '{model}' x/{total} -> {sorted(g['names'], key=len)[0][:40]} "
+            f"({'numbered across sections' if mode == 'whole' and len(g['sections']) > 1 else mode}; {how})")
+        for f in folders:
+            if mode == "whole":
+                e = g["by_index"].get(f["n"])
+            else:
+                lst = g["by_section"][total].get(f["n"], [])
+                e = lst[0] if len(lst) == 1 else None
+            if e is not None:
+                result[e["t_idx"]] = dict(f, entry=e, how=how)
+    return result
+
+
+# ─────────────────────────────────────────────
+# Run summary report (<output>_summary.txt)
+# ─────────────────────────────────────────────
+def find_empty_folders(root: str) -> list[str]:
+    """Names of folders under root that contain no photos at any depth (e.g. an S/N folder with 0 files)."""
+    has_images: dict[str, bool] = {}
+    if not root or not os.path.isdir(root):
+        return []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        own = any(os.path.splitext(f)[1].lower() in VALID_IMG_EXTS for f in filenames)
+        has_images[dirpath] = own or any(has_images.get(os.path.join(dirpath, d), False) for d in dirnames)
+    root_abs = os.path.normpath(root)
+    return sorted({os.path.basename(p) for p, h in has_images.items() if not h and os.path.normpath(p) != root_abs})
+
+
+def summary_path_for(output_path: str) -> str:
+    return os.path.splitext(output_path)[0] + "_summary.txt"
+
+
+def build_injection_summary(doc, *, docx_path: str, photos_root: str, output_path: str, saved: bool,
+                            injected_tables: dict, skip_reasons: dict, start_table: int = 1,
+                            active_models: list | None = None, unused_folders: list | None = None,
+                            unassigned_photos: list | None = None, warnings: list | None = None,
+                            cancelled: bool = False, images_total: int = 0, errors_total: int = 0,
+                            empty_folders: list | None = None) -> str:
+    """
+    Plain-text report of a run, per device group of the document:
+      units with photos, partial units (fewer photos than usual), units without photos + reason,
+    then photo folders not in the document, photos whose S/N could not be read, warnings/errors.
+    injected_tables: {t_idx: (label, n_photos)}; skip_reasons: {t_idx: reason}.
+    """
+    from collections import Counter
+    from datetime import datetime
+
+    pn_to_desc = extract_doc_part_descriptions(doc)
+    entries = {e["t_idx"]: e for e in extract_set_entries(doc)}
+    doc_serials = extract_doc_serials(doc)
+    serial_index = build_sn_index(list(doc_serials.values()))
+
+    # Device tables: tables with 'ชุดที่ N/T', plus tables holding exactly one document serial
+    # that no 'ชุดที่' table already has (a one-row summary table must not count twice).
+    entry_serials = {normalize_sn(e.get("sn")) for e in entries.values() if e.get("sn")}
+    seen_other: set = set()
+    devices = []
+    for t_idx, table in enumerate(doc.tables, start=1):
+        e = entries.get(t_idx)
+        if e:
+            sn = e.get("sn") or ""
+            sn_rc = (e.get("last_row", 0), 1)
+            name = pn_to_desc.get(e.get("pn", "")) or e.get("item", "") or "Devices"
+            group = e["group"]
+            pn = e.get("pn", "")
+        else:
+            found = auto_locate_in_table(table, serial_index)
+            if not found or found["status"] not in ("ok", "no_image_cell"):
+                continue
+            sn, sn_rc = found["sn"], found["sn_rc"]
+            key = normalize_sn(sn)
+            if key in entry_serials or key in seen_other:
+                continue
+            seen_other.add(key)
+            models = extract_table_models(table, sn_row_col=sn_rc, pn_to_desc=pn_to_desc)
+            name = models[0] if models else "Devices"
+            group, pn = name, ""
+        devices.append({"t_idx": t_idx, "sn": sn, "entry": e, "name": name, "group": group, "pn": pn,
+                        "table": table, "sn_rc": sn_rc})
+    empty_keys = {normalize_sn(f) for f in (empty_folders or [])}
+
+    def set_label(d):
+        e = d["entry"]
+        return f"{e['n']}/{e['total']}" if e else f"table {d['t_idx']}"
+
+    def excluded_by_filter(d):
+        if active_models is None:
+            return False
+        if not active_models:
+            return True
+        models = extract_table_models(d["table"], sn_row_col=d["sn_rc"], pn_to_desc=pn_to_desc) + [d["name"]]
+        return not any(model_matches(sel, m) for sel in active_models for m in models)
+
+    groups: dict = {}
+    for d in devices:
+        groups.setdefault(d["group"], []).append(d)
+
+    W = 70
+    out = ["=" * W, "SUMMARY OF PHOTO INJECTION", "=" * W,
+           f"Document : {docx_path}",
+           f"Photos   : {photos_root}",
+           f"Output   : {output_path}" + ("" if saved else "   (NOT saved: no photos inserted)"),
+           f"Date     : {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
+    with_photos_total = sum(1 for d in devices if d["t_idx"] in injected_tables)
+    out.append(f"Result   : {with_photos_total} of {len(devices)} device tables have photos, "
+               f"{images_total} images, {errors_total} error(s)"
+               + ("   [CANCELLED - partial run]" if cancelled else ""))
+    out.append("")
+
+    sec = 0
+    for key, devs in groups.items():
+        sec += 1
+        first = devs[0]
+        title = first["name"] + (f" (Part Number {first['pn']})" if first["pn"] else "")
+        out += ["", f"{sec}. {title} (Total: {len(devs)} Units)", "-" * W]
+
+        counts = [injected_tables[d["t_idx"]][1] for d in devs if d["t_idx"] in injected_tables]
+        typical = Counter(counts).most_common(1)[0][0] if counts else 0
+        before = [d for d in devs if d["t_idx"] < start_table]
+        filtered = [d for d in devs if d["t_idx"] >= start_table and d["t_idx"] not in injected_tables
+                    and excluded_by_filter(d)]
+        partial = [d for d in devs if d["t_idx"] in injected_tables and injected_tables[d["t_idx"]][1] < typical]
+        missing = [d for d in devs if d["t_idx"] >= start_table and d["t_idx"] not in injected_tables
+                   and d not in filtered]
+
+        if counts and not partial and not missing and not before and not filtered:
+            out.append(f"- All {len(devs)} units have photos ({typical} each)")
+        else:
+            out.append(f"- With photos: {len(counts)} unit(s)" + (f" (usually {typical} photos each)" if counts else ""))
+        if partial:
+            out += [f"- Partial (fewer photos than usual): {len(partial)} unit(s)",
+                    f"  {'ชุดที่':<12}| {'Serial Number':<22}| Photos",
+                    f"  {'-' * 12}|{'-' * 23}|{'-' * 7}"]
+            out += [f"  {set_label(d):<12}| {d['sn']:<22}| {injected_tables[d['t_idx']][1]}" for d in partial]
+        if missing:
+            out += [f"- Missing photos: {len(missing)} unit(s)",
+                    f"  {'ชุดที่':<12}| {'Serial Number':<22}| Reason",
+                    f"  {'-' * 12}|{'-' * 23}|{'-' * 30}"]
+            for d in missing:
+                reason = skip_reasons.get(d["t_idx"])
+                if not reason:
+                    reason = ("photo folder is empty (0 files)" if d["sn"] and normalize_sn(d["sn"]) in empty_keys
+                              else "no photos found (no S/N folder, photo or sticker)")
+                out.append(f"  {set_label(d):<12}| {d['sn'] or '-':<22}| {reason}")
+        if filtered:
+            out.append(f"- Not selected in Device Models filter: {len(filtered)} unit(s)")
+        if before:
+            out.append(f"- Before Start Table ({start_table}): {len(before)} unit(s), not processed")
+
+    serial_tables: dict = {}
+    for d in devices:
+        if d["sn"]:
+            serial_tables.setdefault(normalize_sn(d["sn"]), []).append(d)
+    dups = {k: v for k, v in serial_tables.items() if len(v) > 1}
+    if dups:
+        sec += 1
+        out += ["", f"{sec}. Document check: same S/N in more than one table ({len(dups)})", "-" * W]
+        for k, v in dups.items():
+            out.append(f"  {v[0]['sn']:<22} in " + ", ".join(f"{d['name']} {set_label(d)} (table {d['t_idx']})"
+                                                        for d in v))
+    if unused_folders:
+        sec += 1
+        out += ["", f"{sec}. Photo folders not found in the document ({len(unused_folders)})", "-" * W]
+        out += [f"  {f}" for f in unused_folders]
+    if unassigned_photos:
+        sec += 1
+        out += ["", f"{sec}. Photos without a readable S/N - not inserted ({len(unassigned_photos)})", "-" * W]
+        out += [f"  {p}" for p in unassigned_photos]
+    if warnings:
+        sec += 1
+        out += ["", f"{sec}. Warnings and errors ({len(warnings)})", "-" * W]
+        out += [f"  {w.strip()}" for w in warnings]
+    out.append("")
+    return "\n".join(out)
+
+
 def run_injection(docx_path: str, sn_root: str, output_path: str,
                   keyword: str = "WZP",
                   sn_row_col: tuple = (5, 3), img_row_col: tuple = (12, 0),
                   start_table: int = 1,
                   selected_models: list[str] | None = None,
+                  auto_match: bool = False,
+                  photo_ocr: bool = False,
+                  set_number_fallback: bool = False,
+                  max_image_px: int = INSERT_MAX_PX,
+                  workers: int | None = None,
+                  write_summary: bool = True,
                   auto_rotate: bool = True, smart_rotate: bool = False,
                   log_callback=None, progress_callback=None,
                   status_callback=None,
@@ -489,6 +1672,15 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     Main injection logic. Returns InjectionResult (supports 4-tuple unpacking and dict access).
     - start_table: 1-based table index to begin injection. Tables before this index are untouched.
     - selected_models: list of model strings to inject. Non-matching tables/folders are untouched.
+    - auto_match: Auto mode — ignore keyword and fixed S/N cell; scan every cell of each table for a
+      serial that matches a photo folder name, then detect the photo cell (img_row_col is the fallback).
+    - photo_ocr: (auto mode) photos in folders NOT named by a document serial are OCR'd for the S/N
+      on their label; unreadable photos go to the serial shot closest in time.
+    - set_number_fallback: (auto mode) tables still without photos are matched by 'ชุดที่ N/T' to
+      folders named 'N-T' (model folder <-> device group by name and total). S/N always wins.
+    - max_image_px: shrink photos to this long side before inserting (0 = embed originals).
+    - workers: photos prepared in parallel (rotation/OCR/resize); None = automatic.
+    - write_summary: write '<output>_summary.txt' (per device: photos / partial / missing + reasons).
     - status_callback: alias for log_callback.
     - cancel_event: threading.Event — set to stop processing early.
     """
@@ -498,7 +1690,15 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     from PIL import Image as PILImage
 
     status_cb = log_callback or status_callback
+    report_warnings: list[str] = []
+    skip_reasons: dict[int, str] = {}
+    injected_tables: dict[int, tuple] = {}
+    report_unused: list[str] = []
+    report_unassigned: list[str] = []
+
     def log(msg):
+        if "[WARN]" in msg or "[ERR" in msg or "ERROR" in msg:
+            report_warnings.append(msg)
         if status_cb:
             status_cb(msg)
 
@@ -509,13 +1709,75 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     # If selected_models is active, do not restrict folder scanning by keyword prefix
     model_filtering_active = selected_models is not None
     active_models = [str(m).strip() for m in selected_models if m and str(m).strip()] if model_filtering_active else None
-    scan_kw = "" if model_filtering_active else (keyword or "")
+    scan_kw = "" if (model_filtering_active or auto_match) else (keyword or "")
+    if auto_match:
+        log("AUTO MODE: matching serial numbers anywhere in each table")
     log(f"Scanning folders matching '{scan_kw}*'...")
-    sn_folders = find_sn_folders(sn_root, scan_kw)
+    doc = None
+    if auto_match:
+        sn_folders = find_sn_leaf_folders(sn_root, log_cb=log)
+    else:
+        sn_folders = find_sn_folders(sn_root, scan_kw)
     sn_to_model = getattr(sn_folders, 'sn_to_model', {})
     log(f"  Found {len(sn_folders)} folder(s) with images")
 
-    if not sn_folders:
+    if auto_match and photo_ocr and sn_folders:
+        doc = Document(docx_path)
+        doc_serials = extract_doc_serials(doc)
+        unnamed = [name for name in sorted(sn_folders) if normalize_sn(name) not in doc_serials]
+        if unnamed and doc_serials:
+            ocr_imgs = [img for name in unnamed for img in sn_folders[name]]
+            log(f"\nOCR: reading S/N labels in {len(ocr_imgs)} photo(s) from {len(unnamed)} folder(s) "
+                f"not named by serial ({', '.join(unnamed[:3])}{' ...' if len(unnamed) > 3 else ''})")
+            log(f"  Serial numbers in document: {len(doc_serials)}")
+            sticker_lookup = build_set_sticker_lookup(extract_set_entries(doc))
+            if sticker_lookup:
+                log("  Set-number stickers understood (N/total): "
+                    + ", ".join(f"/{t}" for t in sorted(sticker_lookup)))
+            try:
+                groups, unassigned = group_photos_by_ocr(ocr_imgs, doc_serials, log_cb=log,
+                                                         cancel_event=cancel_event,
+                                                         sticker_lookup=sticker_lookup)
+            except Exception as e:
+                groups, unassigned = {}, []
+                log(f"  [ERR ] OCR unavailable: {e}")
+            src_model = next((sn_to_model.get(n) for n in unnamed if sn_to_model.get(n)), None)
+            for name in unnamed:
+                sn_folders.pop(name, None)
+                sn_to_model.pop(name, None)
+            existing = {normalize_sn(k) for k in sn_folders}
+            used = {}
+            for serial, imgs in groups.items():
+                if normalize_sn(serial) in existing:
+                    log(f"  [WARN] {serial}: already has an S/N folder; OCR photos ignored")
+                    continue
+                used[serial] = imgs
+                sn_folders[serial] = imgs
+                if src_model:
+                    sn_to_model[serial] = src_model
+            counts = [len(v) for v in used.values()]
+            if counts:
+                typical = max(set(counts), key=counts.count)
+                odd = sorted(k for k, v in used.items() if len(v) != typical)
+                log(f"  OCR grouped {sum(counts)} photo(s) into {len(used)} serial(s) "
+                    f"(usually {typical} per serial)")
+                if odd:
+                    log(f"  [WARN] {len(odd)} serial(s) with an unusual photo count, please check: "
+                        + ", ".join(f"{k}={len(used[k])}" for k in odd[:8]))
+            if unassigned:
+                report_unassigned.extend(os.path.relpath(p, sn_root) for p in unassigned)
+                log(f"  [WARN] {len(unassigned)} photo(s) without a readable S/N: "
+                    + ", ".join(os.path.basename(p) for p in unassigned[:5]))
+            if is_cancelled():
+                log("\n[CANCELLED] Stopped by user.")
+                return InjectionResult(0, 0, 0, ["Cancelled"])
+
+    set_folders = find_set_number_folders(sn_root) if (auto_match and set_number_fallback) else []
+    if set_folders:
+        log(f"  Found {len(set_folders)} set-number folder(s) (e.g. '{set_folders[0]['name']}') "
+            f"for the ชุดที่ fallback")
+
+    if not sn_folders and not set_folders:
         log(f"ERROR: No matching folders found in the selected directory.")
         return InjectionResult(0, 0, 0, [f"No matching folders found"])
 
@@ -541,7 +1803,8 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
 
     # ── Step 2: Open docx ──
     log(f"\nOpening docx: {os.path.basename(docx_path)}")
-    doc = Document(docx_path)
+    if doc is None:
+        doc = Document(docx_path)
     total_tables = len(doc.tables)
     log(f"  Tables found: {total_tables}")
 
@@ -560,6 +1823,8 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     keyword_upper = keyword.strip().upper() if keyword else ""
 
     pn_to_desc = extract_doc_part_descriptions(doc) if model_filtering_active else None
+    sn_index = build_sn_index(sn_folders.keys()) if auto_match else None
+    auto_skipped = 0
 
     # ── Step 3: Collect eligible candidate tables in sequential document order ──
     candidates = []
@@ -568,11 +1833,32 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             # Skip tables prior to start_table without touching DOM
             continue
 
-        try:
-            sn_cell = table.rows[sn_row_col[0]].cells[sn_row_col[1]]
-            sn = sn_cell.text.strip()
-        except (IndexError, AttributeError):
-            continue
+        table_sn_rc, table_img_rc = sn_row_col, img_row_col
+        if auto_match:
+            found = auto_locate_in_table(table, sn_index, fallback_img_rc=img_row_col)
+            if found is None:
+                continue
+            if found["status"] == "ambiguous":
+                auto_skipped += 1
+                shown = ", ".join(found["sns"][:4]) + (" ..." if len(found["sns"]) > 4 else "")
+                n_serials = max(len(found["sns"]), found.get("list_rows", 0))
+                log(f"  [SKIP] table {t_idx}: {n_serials} serials in one table "
+                    f"(summary/list table?) — {shown}")
+                continue
+            if found["status"] == "no_image_cell":
+                auto_skipped += 1
+                skip_reasons[t_idx] = f"photo folder found, but {found['reason']} in the table"
+                log(f"  [SKIP] {found['sn']} (table {t_idx}): S/N found at "
+                    f"R{found['sn_rc'][0]+1}C{found['sn_rc'][1]+1} but {found['reason']}")
+                continue
+            sn = found["sn"]
+            table_sn_rc, table_img_rc = found["sn_rc"], found["img_rc"]
+        else:
+            try:
+                sn_cell = table.rows[sn_row_col[0]].cells[sn_row_col[1]]
+                sn = sn_cell.text.strip()
+            except (IndexError, AttributeError):
+                continue
 
         if not sn:
             continue
@@ -580,7 +1866,7 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
         if model_filtering_active:
             if not active_models:
                 continue
-            table_models = extract_table_models(table, sn_row_col=sn_row_col, pn_to_desc=pn_to_desc)
+            table_models = extract_table_models(table, sn_row_col=table_sn_rc, pn_to_desc=pn_to_desc)
             folder_model = sn_to_model.get(sn)
             matched = any(
                 any(model_matches(sel, tm) for tm in table_models) or
@@ -589,13 +1875,80 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             )
             if not matched:
                 continue
-        elif keyword_upper:
+        elif keyword_upper and not auto_match:
             if not sn.upper().startswith(keyword_upper):
                 continue
 
-        candidates.append((t_idx, table, sn))
+        if auto_match:
+            log(f"  [FIND] {sn} (table {t_idx}): S/N at R{table_sn_rc[0]+1}C{table_sn_rc[1]+1} "
+                f"-> photo at R{table_img_rc[0]+1}C{table_img_rc[1]+1} ({found['reason']})")
+        candidates.append((t_idx, table, sn, table_img_rc, None))
+
+    # ── Step 3a: the same S/N in several tables (document error) -> photos only in the first one ──
+    if auto_match:
+        first_table: dict[str, int] = {}
+        kept = []
+        for c in candidates:
+            key = normalize_sn(c[2])
+            if key in first_table:
+                skip_reasons[c[0]] = (f"S/N also in table {first_table[key]} (document error?) - "
+                                      f"photos not repeated")
+                log(f"  [WARN] {c[2]}: same S/N in tables {first_table[key]} and {c[0]} - photos used only in "
+                    f"table {first_table[key]}; please check the document")
+                continue
+            first_table[key] = c[0]
+            kept.append(c)
+        candidates = kept
+
+    # ── Step 3b: Fallback — match remaining tables by ชุดที่ (set number) ──
+    if set_folders:
+        log(f"\n  ชุดที่ fallback: matching {len(set_folders)} set-number folder(s)...")
+        entries = extract_set_entries(doc)
+        set_map = map_set_folders_to_tables(set_folders, entries,
+                                            pn_to_desc or extract_doc_part_descriptions(doc), log_cb=log)
+        covered = {c[0] for c in candidates}
+        set_added = set_covered = 0
+        for t_idx in sorted(set_map):
+            m = set_map[t_idx]
+            e = m["entry"]
+            if t_idx < start_table:
+                continue
+            if t_idx in covered:
+                set_covered += 1
+                continue
+            table = doc.tables[t_idx - 1]
+            if model_filtering_active:
+                table_models = extract_table_models(table, sn_row_col=(e["last_row"], 1),
+                                                    pn_to_desc=pn_to_desc)
+                if not active_models or not any(
+                        any(model_matches(sel, tm) for tm in table_models) or model_matches(sel, m["model"])
+                        for sel in active_models):
+                    continue
+            img_rc, reason = detect_image_cell(table, e["last_row"], img_row_col)
+            label = e.get("sn") or f"ชุดที่ {e['n']}/{e['total']}"
+            if img_rc is None:
+                auto_skipped += 1
+                skip_reasons[t_idx] = f"set folder {m['name']} found, but {reason} in the table"
+                log(f"  [SKIP] {label} (table {t_idx}): set folder {m['model']}/{m['name']} but {reason}")
+                continue
+            log(f"  [SET ] {label} (table {t_idx}): ชุดที่ {e['n']}/{e['total']} <- folder "
+                f"{m['model']}/{m['name']} -> photo at R{img_rc[0]+1}C{img_rc[1]+1} ({reason})")
+            candidates.append((t_idx, table, label, img_rc, m["imgs"]))
+            set_added += 1
+        candidates.sort(key=lambda c: c[0])
+        log(f"  ชุดที่ fallback: {set_added} table(s) added, {set_covered} already matched by S/N, "
+            f"{len(set_folders) - len(set_map)} folder(s) not mapped")
 
     log(f"  Eligible tables to evaluate: {len(candidates)}")
+    if auto_match:
+        matched_sns = {c[2] for c in candidates if c[4] is None}
+        unused = [sn for sn in sorted(sn_folders) if sn not in matched_sns]
+        report_unused.extend(unused)
+        log(f"  Auto mode: {len(matched_sns)}/{len(sn_folders)} folder(s) matched, "
+            f"{auto_skipped} table(s) skipped")
+        if unused:
+            log(f"  Folders not found in document ({len(unused)}): "
+                + ", ".join(unused[:10]) + (" ..." if len(unused) > 10 else ""))
 
     if is_cancelled():
         log("\n[CANCELLED] Stopped by user.")
@@ -613,7 +1966,25 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     total = len(candidates)
     current = 0
 
-    for t_idx, table, sn in candidates:
+    _patch_docx_image_sha1_cache()
+
+    # Prepare photos (HEIC/EXIF/Smart Rotate/resize) in parallel, insert them in order below.
+    from concurrent.futures import ThreadPoolExecutor
+    cpus = os.cpu_count() or 2
+    if workers is None:
+        workers = max(1, min(4, cpus // 2)) if smart_rotate else max(1, min(6, cpus))
+    workers = max(1, int(workers))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="prep")
+    prep_futures = {}
+    for t_idx, _t, sn, _rc, set_imgs in candidates:
+        imgs = set_imgs if set_imgs is not None else sn_folders.get(sn)
+        for img_idx, path in enumerate(imgs or []):
+            prep_futures[(t_idx, img_idx)] = pool.submit(prepare_photo, path, auto_rotate, smart_rotate,
+                                                         max_image_px)
+    log(f"  Preparing {len(prep_futures)} photo(s) with {workers} worker(s)"
+        + (f", max {max_image_px}px" if max_image_px else ", original size"))
+
+    for t_idx, table, sn, table_img_rc, set_imgs in candidates:
         if is_cancelled():
             log(f"\n[CANCELLED] Stopped by user at {current}/{total}.")
             break
@@ -622,17 +1993,21 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
         if progress_callback:
             progress_callback(current, total)
 
-        if sn not in sn_folders:
+        if set_imgs is not None:
+            images = set_imgs
+        elif sn not in sn_folders:
             no_folder += 1
+            skip_reasons[t_idx] = "no photo folder found"
             log(f"  [SKIP] {sn} (table {t_idx}): no photo folder found")
             continue
-
-        images = sn_folders[sn]
+        else:
+            images = sn_folders[sn]
 
         try:
-            img_cell = table.rows[img_row_col[0]].cells[img_row_col[1]]
+            img_cell = table.rows[table_img_rc[0]].cells[table_img_rc[1]]
         except IndexError:
-            err_msg = f"{sn}: table {t_idx} has no row {img_row_col[0]}"
+            err_msg = f"{sn}: table {t_idx} has no row {table_img_rc[0]}"
+            skip_reasons[t_idx] = "photo cell missing in the table"
             log(f"  [ERR ] {err_msg}")
             errors.append(err_msg)
             continue
@@ -650,46 +2025,18 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             if is_cancelled():
                 break
             try:
-                ext = os.path.splitext(img_path)[1].lower()
-                if ext in ('.heic', '.heif'):
-                    orig = os.path.basename(img_path)
-                    img_path = convert_heic_to_jpg(img_path)
-                    log(f"      Converted {orig} -> JPG")
-
-                if auto_rotate or smart_rotate:
-                    from PIL import Image as PILImage, ImageOps
-                    try:
-                        with PILImage.open(img_path) as img:
-                            modified = False
-                            if auto_rotate:
-                                img_rotated = ImageOps.exif_transpose(img)
-                                if img_rotated is not None and img_rotated != img:
-                                    img = img_rotated
-                                    modified = True
-                                    log(f"      Auto-rotated (EXIF) {os.path.basename(img_path)}")
-
-                            if modified:
-                                fd, tmp_path = tempfile.mkstemp(suffix='.jpg', prefix='rot_')
-                                os.close(fd)
-                                img.convert('RGB').save(tmp_path, 'JPEG', quality=90, dpi=(72, 72))
-                                _temp_files.append(tmp_path)
-                                img_path = tmp_path
-
-                            if smart_rotate:
-                                best_angle = get_best_orientation(img_path, log_cb=log)
-                                if best_angle != 0:
-                                    with PILImage.open(img_path) as img2:
-                                        img_smart = img2.rotate(best_angle, expand=True)
-                                        fd, tmp_path_smart = tempfile.mkstemp(suffix='.jpg', prefix='ocr_rot_')
-                                        os.close(fd)
-                                        img_smart.convert('RGB').save(tmp_path_smart, 'JPEG', quality=90, dpi=(72, 72))
-                                        _temp_files.append(tmp_path_smart)
-                                        img_path = tmp_path_smart
-                                        log(f"      Smart-rotated (OCR) {best_angle}° for {os.path.basename(img_path)}")
-                                        modified = True
-
-                    except Exception as e:
+                fut = prep_futures.get((t_idx, img_idx))
+                try:
+                    if fut is None:
+                        raise RuntimeError("not prepared")
+                    img_path, notes = fut.result()
+                    for note in notes:
+                        log(f"      {note}")
+                except Exception as e:
+                    if fut is not None:
                         log(f"      Rotation Error for {os.path.basename(img_path)}: {e}")
+                    if os.path.splitext(img_path)[1].lower() in ('.heic', '.heif'):
+                        img_path = convert_heic_to_jpg(img_path)
 
                 width = Cm(14.0)
                 if img_idx == 0:
@@ -706,9 +2053,12 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
                 errors.append(err_msg)
 
         if cell_img_count > 0:
+            injected_tables[t_idx] = (sn, cell_img_count)
             injected += 1
             img_count += cell_img_count
             log(f"  [OK  ] {sn} (table {t_idx:>3}): {cell_img_count} image(s)")
+
+    pool.shutdown(wait=True, cancel_futures=True)
 
     # ── Step 5: Save ──
     cancelled = is_cancelled()
@@ -727,30 +2077,45 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     else:
         log("\nNo images were injected. Output file not saved.")
 
+    summary_file = None
+    if write_summary:
+        try:
+            text = build_injection_summary(
+                doc, docx_path=docx_path, photos_root=sn_root, output_path=output_path,
+                saved=injected > 0, injected_tables=injected_tables, skip_reasons=skip_reasons,
+                start_table=start_table, active_models=active_models, unused_folders=report_unused,
+                unassigned_photos=report_unassigned, warnings=report_warnings, cancelled=cancelled,
+                images_total=img_count, errors_total=len(errors),
+                empty_folders=find_empty_folders(sn_root))
+            summary_file = summary_path_for(output_path)
+            with open(summary_file, "w", encoding="utf-8-sig", newline="\r\n") as fh:
+                fh.write(text)
+            log(f"Summary -> {summary_file}")
+        except Exception as e:
+            summary_file = None
+            log(f"  [WARN] Could not write summary: {e}")
+
     if cancelled:
         log("Process was cancelled by user.")
     else:
         log("Done!")
 
-    return InjectionResult(injected=injected, img_count=img_count, no_folder=no_folder, errors=errors)
+    result = InjectionResult(injected=injected, img_count=img_count, no_folder=no_folder, errors=errors)
+    result["summary_path"] = summary_file
+    return result
 
 
 class TableSelectionDialog(tk.Toplevel):
     def __init__(self, parent, docx_path: str, current_sn_rc: tuple, current_img_rc: tuple, initial_table_idx: int = 0):
         super().__init__(parent)
         self.title("Configure Table Layout")
-        self.geometry("960x640")
+        _k = ui_scale(self)
+        self.geometry(f"{min(int(960 * _k), self.winfo_screenwidth() - 40)}"
+                      f"x{min(int(640 * _k), self.winfo_screenheight() - 80)}")
         self.minsize(800, 520)
 
         # Fallback theme colors to prevent KeyError in headless or partial environments
-        default_colors = {
-            "bg": "#1a1a2e", "card": "#16213e", "card_alt": "#0f3460",
-            "accent": "#e94560", "accent_ok": "#00b894", "text": "#eaeaea",
-            "text_dim": "#8892b0", "input_bg": "#0d1b2a", "input_fg": "#e0e0e0",
-            "border": "#233554", "btn_run": "#00b894", "btn_run_fg": "#ffffff",
-            "btn_stop": "#e94560", "btn_stop_fg": "#ffffff",
-            "btn_pick": "#0f3460", "btn_pick_fg": "#e0e0e0"
-        }
+        default_colors = dict(UI_COLORS)
         parent_colors = getattr(parent, "COLORS", {})
         self.COLORS = {**default_colors, **parent_colors}
 
@@ -813,25 +2178,31 @@ class TableSelectionDialog(tk.Toplevel):
 
         tk.Radiobutton(
             controls, text="Select S/N Cell (Blue)", variable=self.mode, value="sn",
-            bg=self.COLORS["card"], fg="#00a8ff", selectcolor=self.COLORS["bg"],
-            font=("Segoe UI", 10, "bold")
+            bg=self.COLORS["card"], fg=self.COLORS["select_sn"], selectcolor=self.COLORS["card"],
+            activebackground=self.COLORS["card"], activeforeground=self.COLORS["select_sn"],
+            font=("Segoe UI", 10, "bold"), cursor="hand2"
         ).pack(side="left", padx=10, pady=5)
 
         tk.Radiobutton(
             controls, text="Select Image Cell (Green)", variable=self.mode, value="img",
-            bg=self.COLORS["card"], fg="#00b894", selectcolor=self.COLORS["bg"],
-            font=("Segoe UI", 10, "bold")
+            bg=self.COLORS["card"], fg=self.COLORS["select_img"], selectcolor=self.COLORS["card"],
+            activebackground=self.COLORS["card"], activeforeground=self.COLORS["select_img"],
+            font=("Segoe UI", 10, "bold"), cursor="hand2"
         ).pack(side="left", padx=10, pady=5)
 
         tk.Button(
             controls, text="Approve",
             bg=self.COLORS["btn_run"], fg=self.COLORS["btn_run_fg"],
+            activebackground=self.COLORS["btn_run_hover"], activeforeground=self.COLORS["btn_run_fg"],
+            relief="flat", bd=0, padx=16, pady=4, cursor="hand2",
             font=("Segoe UI", 10, "bold"), command=self._approve
         ).pack(side="right", padx=10, pady=5)
 
         tk.Button(
             controls, text="Cancel",
-            bg=self.COLORS["btn_stop"], fg=self.COLORS["btn_stop_fg"],
+            bg=self.COLORS["soft"], fg=self.COLORS["soft_fg"],
+            activebackground=self.COLORS["soft_hover"], activeforeground=self.COLORS["soft_fg"],
+            relief="flat", bd=0, padx=16, pady=4, cursor="hand2",
             font=("Segoe UI", 10, "bold"), command=self.destroy
         ).pack(side="right")
 
@@ -841,8 +2212,9 @@ class TableSelectionDialog(tk.Toplevel):
 
         self.prev_btn = tk.Button(
             nav_bar, text="◀ Previous",
-            bg=self.COLORS.get("btn_pick", "#0f3460"), fg=self.COLORS.get("btn_pick_fg", "#e0e0e0"),
-            font=("Segoe UI", 9, "bold"), activebackground=self.COLORS.get("card_alt", "#0f3460"),
+            bg=self.COLORS["soft"], fg=self.COLORS["soft_fg"], disabledforeground=self.COLORS["disabled_fg"],
+            relief="flat", bd=0, padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 9, "bold"), activebackground=self.COLORS["soft_hover"],
             command=self._prev_table
         )
         self.prev_btn.pack(side="left", padx=(10, 5), pady=5)
@@ -867,8 +2239,9 @@ class TableSelectionDialog(tk.Toplevel):
 
         self.next_btn = tk.Button(
             nav_bar, text="Next ▶",
-            bg=self.COLORS.get("btn_pick", "#0f3460"), fg=self.COLORS.get("btn_pick_fg", "#e0e0e0"),
-            font=("Segoe UI", 9, "bold"), activebackground=self.COLORS.get("card_alt", "#0f3460"),
+            bg=self.COLORS["soft"], fg=self.COLORS["soft_fg"], disabledforeground=self.COLORS["disabled_fg"],
+            relief="flat", bd=0, padx=10, pady=3, cursor="hand2",
+            font=("Segoe UI", 9, "bold"), activebackground=self.COLORS["soft_hover"],
             command=self._next_table
         )
         self.next_btn.pack(side="left", padx=(5, 10), pady=5)
@@ -883,7 +2256,7 @@ class TableSelectionDialog(tk.Toplevel):
         self.coords_label = tk.Label(
             nav_bar,
             text=f"S/N: R{self.sn_rc[0]+1}C{self.sn_rc[1]+1}  |  Image: R{self.img_rc[0]+1}C{self.img_rc[1]+1}",
-            bg=self.COLORS["card"], fg=self.COLORS.get("accent_ok", "#00b894"),
+            bg=self.COLORS["card"], fg=self.COLORS["text"],
             font=("Segoe UI", 9, "bold")
         )
         self.coords_label.pack(side="right", padx=10)
@@ -920,7 +2293,7 @@ class TableSelectionDialog(tk.Toplevel):
         if not self.doc or self.total_tables == 0:
             lbl = tk.Label(
                 self.grid_frame, text="No tables found in the document.",
-                fg=self.COLORS.get("accent", "#e94560"), bg=self.COLORS.get("input_bg", "#0d1b2a"),
+                fg=self.COLORS["btn_stop"], bg=self.COLORS["input_bg"],
                 font=("Segoe UI", 11, "italic")
             )
             lbl.pack(padx=20, pady=20)
@@ -942,8 +2315,8 @@ class TableSelectionDialog(tk.Toplevel):
 
                 btn = tk.Button(
                     self.grid_frame, text=text, width=15, height=2,
-                    bg=self.COLORS.get("card", "#16213e"), fg=self.COLORS.get("text", "#eaeaea"),
-                    activebackground=self.COLORS.get("card_alt", "#0f3460"),
+                    bg=self.COLORS["card"], fg=self.COLORS["text"],
+                    activebackground=self.COLORS["soft"], relief="solid", bd=1, cursor="hand2",
                     command=lambda r=r_idx, c=c_idx: self._on_cell_click(r, c)
                 )
                 btn.grid(row=r_idx, column=c_idx, padx=1, pady=1, sticky="nsew")
@@ -1041,11 +2414,11 @@ class TableSelectionDialog(tk.Toplevel):
     def _update_colors(self):
         for (r, c), btn in self.buttons.items():
             if (r, c) == self.sn_rc:
-                btn.configure(bg="#00a8ff", fg="white")
+                btn.configure(bg=self.COLORS["select_sn"], fg="white")
             elif (r, c) == self.img_rc:
-                btn.configure(bg="#00b894", fg="white")
+                btn.configure(bg=self.COLORS["select_img"], fg="white")
             else:
-                btn.configure(bg=self.COLORS.get("card", "#16213e"), fg=self.COLORS.get("text", "#eaeaea"))
+                btn.configure(bg=self.COLORS["card"], fg=self.COLORS["text"])
 
     def _approve(self):
         self.result = (self.sn_rc, self.img_rc)
@@ -1055,34 +2428,81 @@ class TableSelectionDialog(tk.Toplevel):
 # ─────────────────────────────────────────────
 # GUI Application
 # ─────────────────────────────────────────────
+def enable_windows_dpi_awareness():
+    """Sharp text on high-DPI screens (otherwise Windows stretches the window and it looks blurry).
+    Must run before the first Tk window is created."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def ui_scale(widget) -> float:
+    """1.0 at 100% Windows scaling (96 dpi), 1.5 at 150%, ... used to size windows."""
+    try:
+        return max(1.0, float(widget.tk.call("tk", "scaling")) / (96 / 72))
+    except Exception:
+        return 1.0
+
+
+UI_COLORS = {
+    "bg":            "#eef2f7",   # window background (soft grey-blue)
+    "card":          "#ffffff",   # cards
+    "card_alt":      "#f1f5f9",   # subtle fills
+    "border":        "#d5dce6",
+    "text":          "#1e293b",   # main text (dark slate)
+    "text_dim":      "#64748b",   # secondary text
+    "input_bg":      "#f8fafc",
+    "input_fg":      "#0f172a",
+    "accent":        "#2563eb",   # blue: selection / links
+    "accent_ok":     "#15803d",   # green text (success / info that is OK)
+    "warn":          "#b45309",   # amber text (warnings)
+    "btn_run":       "#16a34a",   # big green Run button
+    "btn_run_hover": "#15803d",
+    "btn_run_fg":    "#ffffff",
+    "btn_stop":      "#dc2626",   # red Stop button (only while it can be pressed)
+    "btn_stop_hover":"#b91c1c",
+    "btn_stop_fg":   "#ffffff",
+    "btn_pick":      "#2563eb",   # blue Browse buttons
+    "btn_pick_hover":"#1d4ed8",
+    "btn_pick_fg":   "#ffffff",
+    "soft":          "#e0e7ff",   # light-blue secondary buttons
+    "soft_hover":    "#c7d2fe",
+    "soft_fg":       "#1e40af",
+    "disabled_bg":   "#e2e8f0",
+    "disabled_fg":   "#94a3b8",
+    "select_sn":     "#2563eb",   # Configure Layout: S/N cell
+    "select_img":    "#16a34a",   # Configure Layout: image cell
+    "log_bg":        "#0f172a",   # dark console log
+    "log_fg":        "#e2e8f0",
+}
+
+
 class App(tk.Tk):
     def __init__(self):
+        enable_windows_dpi_awareness()
         super().__init__()
 
         self.title(f"{__app_name__} v{__version__}")
-        self.geometry("850x720")
-        self.minsize(720, 580)
-        self.configure(bg="#1a1a2e")
+        k = ui_scale(self)
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width = min(int(940 * k), screen_w - int(40 * k))
+        height = min(int(920 * k), screen_h - int(90 * k))
+        self.geometry(f"{width}x{height}")
+        self.minsize(min(int(780 * k), width), min(int(620 * k), height))
 
         # ── Colors ──
-        self.COLORS = {
-            "bg":         "#1a1a2e",
-            "card":       "#16213e",
-            "card_alt":   "#0f3460",
-            "accent":     "#e94560",
-            "accent_ok":  "#00b894",
-            "text":       "#eaeaea",
-            "text_dim":   "#8892b0",
-            "input_bg":   "#0d1b2a",
-            "input_fg":   "#e0e0e0",
-            "border":     "#233554",
-            "btn_run":    "#00b894",
-            "btn_run_fg": "#ffffff",
-            "btn_stop":   "#e94560",
-            "btn_stop_fg":"#ffffff",
-            "btn_pick":   "#0f3460",
-            "btn_pick_fg":"#e0e0e0",
-        }
+        # Light theme, one meaning per colour: green = run/success, red = stop/error,
+        # blue = buttons/selection, amber = warnings. The log keeps a dark console look.
+        self.COLORS = UI_COLORS.copy()
+        self.configure(bg=self.COLORS["bg"])
 
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -1099,16 +2519,22 @@ class App(tk.Tk):
                          font=("Segoe UI", 10))
         style.configure("Version.TLabel",
                          background=self.COLORS["bg"],
-                         foreground=self.COLORS["card_alt"],
+                         foreground=self.COLORS["text_dim"],
                          font=("Segoe UI", 9))
         style.configure("Status.TLabel",
                          background=self.COLORS["bg"],
                          foreground=self.COLORS["accent_ok"],
-                         font=("Segoe UI", 10))
+                         font=("Segoe UI", 10, "bold"))
         style.configure("green.Horizontal.TProgressbar",
-                         troughcolor=self.COLORS["input_bg"],
-                         background=self.COLORS["accent_ok"],
-                         thickness=8)
+                         troughcolor=self.COLORS["disabled_bg"],
+                         background=self.COLORS["btn_run"],
+                         bordercolor=self.COLORS["disabled_bg"],
+                         lightcolor=self.COLORS["btn_run"],
+                         darkcolor=self.COLORS["btn_run"],
+                         thickness=10)
+        style.configure("Vertical.TScrollbar", background=self.COLORS["card_alt"],
+                         troughcolor=self.COLORS["card"], bordercolor=self.COLORS["border"],
+                         arrowcolor=self.COLORS["text_dim"])
 
         self._running = False
         self._cancel_event = threading.Event()
@@ -1116,6 +2542,10 @@ class App(tk.Tk):
         self.img_row_col = (12, 0)
         self.auto_rotate_var = tk.BooleanVar(value=True)
         self.smart_rotate_var = tk.BooleanVar(value=True)
+        self.shrink_photos_var = tk.BooleanVar(value=True)
+        self.auto_match_var = tk.BooleanVar(value=True)
+        self.photo_ocr_var = tk.BooleanVar(value=True)
+        self.set_fallback_var = tk.BooleanVar(value=True)
 
         # ── Milestone 2 State Variables ──
         self.start_table_var = tk.StringVar(value="1")
@@ -1140,6 +2570,12 @@ class App(tk.Tk):
         title_row.pack(fill="x")
         ttk.Label(title_row, text=__app_name__, style="Title.TLabel").pack(side="left")
         ttk.Label(title_row, text=f"v{__version__}", style="Version.TLabel").pack(side="left", padx=(8, 0), anchor="s")
+        tk.Button(
+            title_row, text="❓  วิธีใช้", font=(self._thai_font(), 11, "bold"),
+            bg=C["soft"], fg=C["soft_fg"], activebackground=C["soft_hover"],
+            activeforeground=C["soft_fg"], relief="flat", bd=0, cursor="hand2", padx=16, pady=5,
+            command=self._show_help
+        ).pack(side="right")
 
         ttk.Label(header, text="Insert device photos from SN folders into Unit Test Word document",
                   style="Subtitle.TLabel").pack(anchor="w", pady=(2, 0))
@@ -1163,69 +2599,70 @@ class App(tk.Tk):
         self._make_file_card(inputs_frame, "Output File (.docx)",
                              self.output_var, self._pick_output, icon="💾")
 
+        # ── Options card (two groups) ──
+        self._make_options_card(inputs_frame)
+
         # ── Button Row ──
         btn_frame = ttk.Frame(self, style="BG.TFrame")
-        btn_frame.pack(fill="x", padx=20, pady=(5, 5))
+        btn_frame.pack(fill="x", padx=20, pady=(6, 4))
 
         self.run_btn = tk.Button(
             btn_frame,
             text="▶  Run Injection",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 13, "bold"),
             bg=C["btn_run"], fg=C["btn_run_fg"],
-            activebackground="#00a885", activeforeground="#fff",
-            relief="flat", cursor="hand2", padx=24, pady=8,
+            activebackground=C["btn_run_hover"], activeforeground=C["btn_run_fg"],
+            disabledforeground=C["disabled_fg"],
+            relief="flat", bd=0, cursor="hand2", padx=28, pady=9,
             command=self._on_run
         )
         self.run_btn.pack(side="left")
+        self._add_hover(self.run_btn, C["btn_run"], C["btn_run_hover"])
 
         self.stop_btn = tk.Button(
             btn_frame,
             text="■  Stop",
-            font=("Segoe UI", 12, "bold"),
-            bg=C["btn_stop"], fg=C["btn_stop_fg"],
-            activebackground="#c0392b", activeforeground="#fff",
-            relief="flat", cursor="hand2", padx=24, pady=8,
+            font=("Segoe UI", 13, "bold"),
+            bg=C["disabled_bg"], fg=C["btn_stop_fg"],
+            activebackground=C["btn_stop_hover"], activeforeground=C["btn_stop_fg"],
+            disabledforeground=C["disabled_fg"],
+            relief="flat", bd=0, cursor="hand2", padx=24, pady=9,
             command=self._on_stop,
             state="disabled"
         )
         self.stop_btn.pack(side="left", padx=(10, 0))
 
-        opts_frame = ttk.Frame(btn_frame, style="BG.TFrame")
-        opts_frame.pack(side="left", padx=10)
-
-        tk.Checkbutton(
-            opts_frame, text="Auto-Rotate (EXIF)", variable=self.auto_rotate_var,
-            bg=C["bg"], fg=C["text"], selectcolor=C["card"], activebackground=C["bg"],
-            activeforeground=C["text"], font=("Segoe UI", 9)
-        ).pack(anchor="w")
-
-        tk.Checkbutton(
-            opts_frame, text="Smart Rotate (OpenThai OCR · CPU)", variable=self.smart_rotate_var,
-            bg=C["bg"], fg="#a29bfe", selectcolor=C["card"], activebackground=C["bg"],
-            activeforeground="#a29bfe", font=("Segoe UI", 9, "bold")
-        ).pack(anchor="w")
+        self._last_summary = None
+        self.summary_btn = tk.Button(
+            btn_frame, text="📄  Summary", font=("Segoe UI", 11, "bold"),
+            bg=C["disabled_bg"], fg=C["soft_fg"], disabledforeground=C["disabled_fg"],
+            activebackground=C["soft_hover"], activeforeground=C["soft_fg"],
+            relief="flat", bd=0, cursor="hand2", padx=16, pady=9,
+            command=self._open_summary, state="disabled"
+        )
+        self.summary_btn.pack(side="right")
 
         self.status_label = ttk.Label(btn_frame, text="Ready", style="Status.TLabel")
-        self.status_label.pack(side="left", padx=15)
+        self.status_label.pack(side="left", padx=16)
 
         # ── Progress Bar ──
         self.progress = ttk.Progressbar(self, style="green.Horizontal.TProgressbar",
                                          orient="horizontal", mode="determinate")
-        self.progress.pack(fill="x", padx=20, pady=(0, 5))
+        self.progress.pack(fill="x", padx=20, pady=(2, 8))
 
-        # ── Log Area ──
-        log_frame = tk.Frame(self, bg=C["card"], bd=0, highlightthickness=1,
+        # ── Log Area (dark console) ──
+        log_frame = tk.Frame(self, bg=C["log_bg"], bd=0, highlightthickness=1,
                              highlightbackground=C["border"])
         log_frame.pack(fill="both", expand=True, padx=20, pady=(0, 18))
 
         self.log_text = tk.Text(
             log_frame,
-            bg=C["input_bg"], fg=C["input_fg"],
+            bg=C["log_bg"], fg=C["log_fg"],
             font=("Cascadia Code", 9),
-            insertbackground=C["text"],
-            selectbackground=C["accent"],
-            relief="flat", wrap="word",
-            padx=10, pady=8,
+            insertbackground=C["log_fg"],
+            selectbackground="#334155",
+            relief="flat", wrap="word", height=8,
+            padx=12, pady=8,
             state="disabled"
         )
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
@@ -1233,13 +2670,89 @@ class App(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self.log_text.pack(fill="both", expand=True)
 
-        self.log_text.tag_configure("ok",       foreground="#00b894")
-        self.log_text.tag_configure("err",      foreground="#e94560")
-        self.log_text.tag_configure("info",     foreground="#8892b0")
-        self.log_text.tag_configure("title",    foreground="#e0e0e0", font=("Cascadia Code", 9, "bold"))
-        self.log_text.tag_configure("cancel",   foreground="#f39c12")
+        self.log_text.tag_configure("ok",       foreground="#4ade80")
+        self.log_text.tag_configure("err",      foreground="#f87171")
+        self.log_text.tag_configure("warn",     foreground="#fbbf24")
+        self.log_text.tag_configure("info",     foreground="#94a3b8")
+        self.log_text.tag_configure("title",    foreground="#f1f5f9", font=("Cascadia Code", 9, "bold"))
+        self.log_text.tag_configure("cancel",   foreground="#fb923c")
 
         self._auto_detect_paths()
+        self.kw_entry.configure(state="disabled" if self.auto_match_var.get() else "normal")
+
+    def _add_hover(self, btn, normal_bg, hover_bg):
+        """Darken a flat button while the mouse is over it (only when it is enabled)."""
+        def enter(_e):
+            if str(btn["state"]) != "disabled":
+                btn.configure(bg=hover_bg)
+
+        def leave(_e):
+            if str(btn["state"]) != "disabled":
+                btn.configure(bg=normal_bg)
+        btn.bind("<Enter>", enter)
+        btn.bind("<Leave>", leave)
+
+    def _make_path_label(self, parent, var):
+        """Selected path, or a grey hint when nothing is selected yet."""
+        C = self.COLORS
+        lbl = tk.Label(parent, bg=C["card"], anchor="w")
+        lbl.pack(fill="x", pady=(4, 0))
+
+        def refresh(*_):
+            value = var.get().strip()
+            if value:
+                lbl.configure(text=value, fg=C["text_dim"], font=("Consolas", 9))
+            else:
+                lbl.configure(text="ยังไม่ได้เลือก — กด Browse", fg=C["disabled_fg"],
+                              font=(self._thai_font(), 9, "italic"))
+        var.trace_add("write", refresh)
+        refresh()
+        return lbl
+
+    def _option_check(self, parent, text, var, command=None, sub=False):
+        C = self.COLORS
+        cb = tk.Checkbutton(
+            parent, text=text, variable=var, command=command,
+            bg=C["card"], fg=C["text"] if not sub else C["text_dim"],
+            selectcolor=C["card"], activebackground=C["card"], activeforeground=C["accent"],
+            disabledforeground=C["disabled_fg"], font=("Segoe UI", 10 if not sub else 9),
+            anchor="w", bd=0, highlightthickness=0, cursor="hand2"
+        )
+        cb.pack(anchor="w", padx=(22 if sub else 0, 0), pady=1)
+        return cb
+
+    def _make_options_card(self, parent):
+        """Options in two labelled groups: photo processing and S/N matching."""
+        C = self.COLORS
+        card = tk.Frame(parent, bg=C["card"], bd=0, highlightthickness=1,
+                        highlightbackground=C["border"])
+        card.pack(fill="x", pady=4)
+        inner = tk.Frame(card, bg=C["card"])
+        inner.pack(fill="x", padx=14, pady=10)
+        inner.columnconfigure(0, weight=1, uniform="opt")
+        inner.columnconfigure(1, weight=1, uniform="opt")
+
+        left = tk.Frame(inner, bg=C["card"])
+        left.grid(row=0, column=0, sticky="nw")
+        right = tk.Frame(inner, bg=C["card"])
+        right.grid(row=0, column=1, sticky="nw", padx=(12, 0))
+
+        tk.Label(left, text="📷  Photos", bg=C["card"], fg=C["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
+        self._option_check(left, "Auto-Rotate (EXIF)", self.auto_rotate_var)
+        self._option_check(left, "Smart Rotate (OCR, makes text upright)", self.smart_rotate_var)
+        self._option_check(left, f"Shrink photos to {INSERT_MAX_PX}px (faster, smaller)",
+                           self.shrink_photos_var)
+
+        tk.Label(right, text="🔎  Matching", bg=C["card"], fg=C["text"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
+        self._option_check(right, "Auto-match S/N in tables (recommended)",
+                           self.auto_match_var, command=self._on_auto_match_toggle)
+        self.photo_ocr_cb = self._option_check(
+            right, "Read S/N from photos (OCR)",
+            self.photo_ocr_var, sub=True)
+        self.set_fallback_cb = self._option_check(
+            right, "Fallback: ชุดที่ folders (12-280)", self.set_fallback_var, sub=True)
 
     def _make_file_card(self, parent, label_text, var, command, icon="📄", with_config=False):
         C = self.COLORS
@@ -1257,28 +2770,27 @@ class App(tk.Tk):
                  font=("Segoe UI", 10, "bold")).pack(side="left")
 
         btn = tk.Button(top, text="Browse",
-                        font=("Segoe UI", 9),
+                        font=("Segoe UI", 9, "bold"),
                         bg=C["btn_pick"], fg=C["btn_pick_fg"],
-                        activebackground=C["card_alt"],
-                        relief="flat", cursor="hand2",
-                        padx=12, pady=2,
+                        activebackground=C["btn_pick_hover"], activeforeground=C["btn_pick_fg"],
+                        relief="flat", bd=0, cursor="hand2",
+                        padx=16, pady=4,
                         command=command)
         btn.pack(side="right")
+        self._add_hover(btn, C["btn_pick"], C["btn_pick_hover"])
         
         if with_config:
             self.config_btn = tk.Button(top, text="⚙ Configure Layout",
                                         font=("Segoe UI", 9),
-                                        bg=C["border"], fg=C["text"],
-                                        activebackground=C["card_alt"],
-                                        relief="flat", cursor="hand2",
-                                        padx=12, pady=2,
+                                        bg=C["soft"], fg=C["soft_fg"],
+                                        activebackground=C["soft_hover"], activeforeground=C["soft_fg"],
+                                        relief="flat", bd=0, cursor="hand2",
+                                        padx=12, pady=4,
                                         command=self._configure_layout)
-            self.config_btn.pack(side="right", padx=(0, 10))
+            self.config_btn.pack(side="right", padx=(0, 8))
+            self._add_hover(self.config_btn, C["soft"], C["soft_hover"])
 
-        path_label = tk.Label(inner, textvariable=var,
-                              bg=C["card"], fg=C["text_dim"],
-                              font=("Consolas", 9), anchor="w")
-        path_label.pack(fill="x", pady=(4, 0))
+        self._make_path_label(inner, var)
         
         if with_config:
             bottom_row = tk.Frame(inner, bg=C["card"])
@@ -1304,13 +2816,13 @@ class App(tk.Tk):
                 start_frame, from_=1, to=1,
                 textvariable=self.start_table_var,
                 width=5,
-                bg=C.get("input_bg", "#0d1b2a"), fg=C.get("accent_ok", "#00b894"),
-                buttonbackground=C.get("btn_pick", "#0f3460"),
-                insertbackground=C.get("text", "#eaeaea"),
+                bg=C["input_bg"], fg=C["text"],
+                buttonbackground=C["card_alt"],
+                insertbackground=C["text"],
                 relief="flat",
                 highlightthickness=1,
-                highlightbackground=C.get("border", "#233554"),
-                highlightcolor=C.get("accent_ok", "#00b894"),
+                highlightbackground=C["border"],
+                highlightcolor=C["accent"],
                 font=("Consolas", 9, "bold"),
                 command=self._on_start_table_changed
             )
@@ -1343,13 +2855,14 @@ class App(tk.Tk):
                  font=("Segoe UI", 10, "bold")).pack(side="left")
 
         btn = tk.Button(top, text="Browse",
-                        font=("Segoe UI", 9),
+                        font=("Segoe UI", 9, "bold"),
                         bg=C["btn_pick"], fg=C["btn_pick_fg"],
-                        activebackground=C["card_alt"],
-                        relief="flat", cursor="hand2",
-                        padx=12, pady=2,
+                        activebackground=C["btn_pick_hover"], activeforeground=C["btn_pick_fg"],
+                        relief="flat", bd=0, cursor="hand2",
+                        padx=16, pady=4,
                         command=self._pick_sn_root)
         btn.pack(side="right")
+        self._add_hover(btn, C["btn_pick"], C["btn_pick_hover"])
 
         # Keyword entry inline
         kw_frame = tk.Frame(top, bg=C["card"])
@@ -1359,26 +2872,25 @@ class App(tk.Tk):
                  bg=C["card"], fg=C["text_dim"],
                  font=("Segoe UI", 9)).pack(side="left")
 
-        kw_entry = tk.Entry(kw_frame,
+        self.kw_entry = kw_entry = tk.Entry(kw_frame,
                             textvariable=self.keyword_var,
-                            bg=C["input_bg"], fg=C["accent_ok"],
+                            bg=C["input_bg"], fg=C["text"],
                             font=("Consolas", 10, "bold"),
                             insertbackground=C["text"],
                             relief="flat", width=12,
+                            disabledbackground=C["disabled_bg"],
+                            disabledforeground=C["disabled_fg"],
                             highlightthickness=1,
                             highlightbackground=C["border"],
-                            highlightcolor=C["accent_ok"])
+                            highlightcolor=C["accent"])
         kw_entry.pack(side="left", padx=(5, 0))
 
         tk.Label(kw_frame, text="*",
-                 bg=C["card"], fg=C["accent_ok"],
+                 bg=C["card"], fg=C["text_dim"],
                  font=("Consolas", 10, "bold")).pack(side="left")
 
         # Path display
-        path_label = tk.Label(inner, textvariable=self.sn_root_var,
-                              bg=C["card"], fg=C["text_dim"],
-                              font=("Consolas", 9), anchor="w")
-        path_label.pack(fill="x", pady=(4, 0))
+        self._make_path_label(inner, self.sn_root_var)
 
         # ── Device Models Multi-Select Filter ──
         models_header = tk.Frame(inner, bg=C["card"])
@@ -1392,9 +2904,9 @@ class App(tk.Tk):
         self.btn_select_all = tk.Button(
             models_header, text="Select All",
             font=("Segoe UI", 8),
-            bg=C.get("card_alt", "#0f3460"), fg=C.get("text", "#eaeaea"),
-            activebackground=C.get("btn_pick", "#0f3460"), activeforeground=C.get("text", "#eaeaea"),
-            relief="flat", cursor="hand2", padx=6, pady=1,
+            bg=C["soft"], fg=C["soft_fg"], disabledforeground=C["disabled_fg"],
+            activebackground=C["soft_hover"], activeforeground=C["soft_fg"],
+            relief="flat", bd=0, cursor="hand2", padx=8, pady=2,
             command=self._select_all_models,
             state="disabled"
         )
@@ -1403,9 +2915,9 @@ class App(tk.Tk):
         self.btn_deselect_all = tk.Button(
             models_header, text="Deselect All",
             font=("Segoe UI", 8),
-            bg=C.get("card_alt", "#0f3460"), fg=C.get("text", "#eaeaea"),
-            activebackground=C.get("btn_pick", "#0f3460"), activeforeground=C.get("text", "#eaeaea"),
-            relief="flat", cursor="hand2", padx=6, pady=1,
+            bg=C["soft"], fg=C["soft_fg"], disabledforeground=C["disabled_fg"],
+            activebackground=C["soft_hover"], activeforeground=C["soft_fg"],
+            relief="flat", bd=0, cursor="hand2", padx=8, pady=2,
             command=self._deselect_all_models,
             state="disabled"
         )
@@ -1533,7 +3045,7 @@ class App(tk.Tk):
             self.models_placeholder = tk.Label(
                 self.models_container,
                 text="(No models detected yet — select document or photo folder to scan)",
-                bg=self.COLORS.get("card", "#16213e"), fg=self.COLORS.get("text_dim", "#8892b0"),
+                bg=self.COLORS["card"], fg=self.COLORS["text_dim"],
                 font=("Segoe UI", 9, "italic"), anchor="w"
             )
             self.models_placeholder.pack(anchor="w")
@@ -1561,17 +3073,18 @@ class App(tk.Tk):
                 self.models_container,
                 text=model,
                 variable=var,
-                bg=self.COLORS.get("card", "#16213e"),
-                fg=self.COLORS.get("text", "#eaeaea"),
-                selectcolor=self.COLORS.get("input_bg", "#0d1b2a"),
-                activebackground=self.COLORS.get("card", "#16213e"),
-                activeforeground=self.COLORS.get("accent_ok", "#00b894"),
-                font=("Segoe UI", 9),
+                bg=self.COLORS["card"],
+                fg=self.COLORS["text"],
+                selectcolor=self.COLORS["card"],
+                activebackground=self.COLORS["card"],
+                activeforeground=self.COLORS["accent"],
+                font=("Segoe UI", 9), bd=0, highlightthickness=0, cursor="hand2",
                 command=self._on_model_toggle
             )
-            row = idx // 4
-            col = idx % 4
-            cb.grid(row=row, column=col, sticky="w", padx=(0, 15), pady=2)
+            n_cols = 3 if max(len(m) for m in models) <= 40 else 2
+            row = idx // n_cols
+            col = idx % n_cols
+            cb.grid(row=row, column=col, sticky="w", padx=(0, 12), pady=1)
 
         self.model_vars = new_vars
         self._on_model_toggle()
@@ -1651,6 +3164,8 @@ class App(tk.Tk):
                 tag = "err"
             elif "CANCELLED" in msg or "cancelled" in msg:
                 tag = "cancel"
+            elif "[WARN]" in msg:
+                tag = "warn"
             elif msg.startswith("  [") or msg.startswith("    "):
                 tag = "info"
             elif "═" in msg or "─" in msg:
@@ -1675,18 +3190,211 @@ class App(tk.Tk):
     def _set_running(self, running: bool):
         def _update():
             self._running = running
+            C = self.COLORS
             if running:
-                self.run_btn.configure(state="disabled", bg="#555")
-                self.stop_btn.configure(state="normal")
+                self.run_btn.configure(state="disabled", bg=C["disabled_bg"])
+                self.stop_btn.configure(state="normal", bg=C["btn_stop"])
+                self._add_hover(self.stop_btn, C["btn_stop"], C["btn_stop_hover"])
             else:
-                self.run_btn.configure(state="normal", bg=self.COLORS["btn_run"])
-                self.stop_btn.configure(state="disabled")
+                self.run_btn.configure(state="normal", bg=C["btn_run"])
+                self.stop_btn.configure(state="disabled", bg=C["disabled_bg"])
         self.after(0, _update)
+
+    def _open_summary(self):
+        """Open the last run's '<output>_summary.txt' with the default text editor."""
+        path = getattr(self, "_last_summary", None)
+        if not path or not os.path.isfile(path):
+            messagebox.showinfo("Summary", "No summary yet - run the injection first.")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa: S606 (opens in Notepad / default editor)
+            else:
+                import subprocess
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+        except Exception as e:
+            messagebox.showerror("Summary", f"Could not open {path}:\n{e}")
+
+    def _thai_font(self) -> str:
+        """A font that renders Thai well on this OS."""
+        cached = getattr(self, "_thai_font_name", None)
+        if cached:
+            return cached
+        try:
+            from tkinter import font as tkfont
+            families = set(tkfont.families(self))
+        except Exception:
+            families = set()
+        for name in ("Leelawadee UI", "Leelawadee", "Tahoma", "Thonburi", "Sukhumvit Set",
+                     "Noto Sans Thai", "Segoe UI"):
+            if name in families:
+                self._thai_font_name = name
+                return name
+        self._thai_font_name = "TkDefaultFont"
+        return self._thai_font_name
+
+    def _show_help(self):
+        """Open (or focus) the Thai usage guide window."""
+        existing = getattr(self, "_help_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        from help_text import HELP_TITLE, HELP_SECTIONS
+        C = self.COLORS
+        f = self._thai_font()
+
+        win = tk.Toplevel(self)
+        win.title(HELP_TITLE)
+        win.configure(bg=C["bg"])
+        k = ui_scale(self)
+        win.geometry(f"{min(int(860 * k), self.winfo_screenwidth() - 40)}"
+                     f"x{min(int(740 * k), self.winfo_screenheight() - int(90 * k))}")
+        win.minsize(int(560 * k), int(420 * k))
+        self._help_win = win
+
+        bottom = tk.Frame(win, bg=C["bg"])
+        bottom.pack(side="bottom", fill="x", padx=14, pady=(0, 12))  # packed first so it never gets squeezed out
+        frame = tk.Frame(win, bg=C["card"], highlightthickness=1, highlightbackground=C["border"])
+        frame.pack(fill="both", expand=True, padx=14, pady=(14, 8))
+        PADX = 22
+        # wrap="none": Tk's own word-wrap mis-measures shaped Thai text and can split a consonant
+        # from its vowel/tone mark (shown as ◌่). Lines are broken here instead, only at spaces,
+        # using the real font width, and re-laid out when the window is resized.
+        text = tk.Text(frame, bg=C["card"], fg=C["text"], wrap="none", relief="flat", height=10,
+                       padx=PADX, pady=16, font=(f, 11), cursor="arrow", highlightthickness=0)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
+        from tkinter import font as tkfont
+        # kind: (font, colour, first-line indent, continuation indent, space above, space below, bg)
+        styles = {
+            "h1":   ((f, 16, "bold"), C["text"], 0, 0, 14, 8, None),
+            "h2":   ((f, 12, "bold"), C["accent"], 0, 0, 10, 4, None),
+            "p":    ((f, 11), C["text"], 0, 0, 2, 4, None),
+            "li":   ((f, 11), C["text"], 14, 30, 2, 4, None),
+            "step": ((f, 12, "bold"), C["text"], 10, 36, 4, 4, None),
+            "tip":  ((f, 11), C["accent_ok"], 10, 26, 6, 4, None),
+            "warn": ((f, 11), C["warn"], 10, 32, 6, 4, None),
+            "code": (("Consolas", 10), "#334155", 24, 24, 4, 6, C["card_alt"]),
+            "gap":  ((f, 6), C["text"], 0, 0, 0, 0, None),
+        }
+        fonts = {k: tkfont.Font(win, font=v[0]) for k, v in styles.items()}
+        made_tags = set()
+
+        def tag_for(kind, first, last):
+            name = f"{kind}:{int(first)}{int(last)}"
+            if name not in made_tags:
+                font, fg, ind1, ind2, sp1, sp3, bg = styles[kind]
+                indent = ind1 if first else ind2
+                opts = dict(font=font, foreground=fg, lmargin1=indent, lmargin2=indent,
+                            spacing1=sp1 if first else 1, spacing3=sp3 if last else 1)
+                if bg:
+                    opts["background"] = bg
+                text.tag_configure(name, **opts)
+                text.tag_configure(name + "~", **opts)  # identical twin, see insert_line()
+                made_tags.add(name)
+            return name
+
+        def insert_line(line, tag):
+            """
+            Tk on Windows draws text in 200-byte (UTF-8) pieces; a piece boundary inside a Thai
+            cluster splits a consonant from its tone/vowel mark. Insert the line in <=180-byte
+            pieces cut at spaces, alternating two identical tags so Tk draws each piece separately.
+            """
+            if len(line.encode("utf-8")) <= 180:
+                text.insert("end", line + "\n", tag)
+                return
+            pieces, cur = [], ""
+            for word in line.split(" "):
+                cand = word if not cur else cur + " " + word
+                if cur and len(cand.encode("utf-8")) > 180:
+                    pieces.append(cur + " ")
+                    cur = word
+                else:
+                    cur = cand
+            pieces.append(cur)
+            for k, piece in enumerate(pieces):
+                text.insert("end", piece, tag if k % 2 == 0 else tag + "~")
+            text.insert("end", "\n", tag)
+
+        def wrap_line(line, fnt, first_w, cont_w):
+            if fnt.measure(line) <= first_w:
+                return [line]
+            out, cur, width = [], "", first_w
+            for word in line.split(" "):
+                cand = word if not cur else cur + " " + word
+                if cur and fnt.measure(cand) > width:
+                    out.append(cur)
+                    cur, width = word, cont_w
+                else:
+                    cur = cand
+            out.append(cur)
+            return out
+
+        layout_state = {"width": None, "job": None}
+
+        def layout(force=False):
+            layout_state["job"] = None
+            avail = text.winfo_width() - 2 * PADX - 12
+            if avail < 100 or (not force and avail == layout_state["width"]):
+                return
+            layout_state["width"] = avail
+            top = text.yview()[0]
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            for kind, content in HELP_SECTIONS:
+                _, _, ind1, ind2, *_ = styles[kind]
+                fnt = fonts[kind]
+                lines = []
+                for i, para in enumerate(content.split("\n")):
+                    if kind == "code":
+                        lines.append(para)
+                    else:
+                        lines += wrap_line(para, fnt, avail - (ind1 if i == 0 else ind2), avail - ind2)
+                for i, ln in enumerate(lines):
+                    insert_line(ln, tag_for(kind, i == 0, i == len(lines) - 1))
+            text.configure(state="disabled")
+            text.yview_moveto(top)
+
+        def on_resize(_event=None):
+            if layout_state["job"]:
+                win.after_cancel(layout_state["job"])
+            layout_state["job"] = win.after(60, layout)
+
+        text.bind("<Configure>", on_resize)
+        win.update_idletasks()
+        layout(force=True)
+
+        tk.Label(bottom, text=f"{__app_name__}  v{__version__}", bg=C["bg"], fg=C["text_dim"],
+                 font=(f, 9)).pack(side="left")
+        tk.Button(bottom, text="ปิด", font=(f, 11, "bold"), bg=C["btn_run"], fg=C["btn_run_fg"],
+                  activebackground=C["btn_run_hover"], activeforeground="#fff", relief="flat", bd=0,
+                  cursor="hand2", padx=22, pady=4, command=win.destroy).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.focus_force()
+
+    def _on_auto_match_toggle(self):
+        auto = self.auto_match_var.get()
+        entry = getattr(self, "kw_entry", None)
+        if entry is not None:
+            entry.configure(state="disabled" if auto else "normal")
+        for name in ("photo_ocr_cb", "set_fallback_cb"):
+            cb = getattr(self, name, None)
+            if cb is not None:
+                cb.configure(state="normal" if auto else "disabled")
+        if auto:
+            self._log("Auto-match ON: serials are found anywhere in each table; keyword and S/N cell are ignored.")
+        else:
+            self._log("Auto-match OFF: using keyword and configured S/N / Image cells.")
 
     def _on_stop(self):
         if self._running:
             self._cancel_event.set()
-            self.status_label.configure(text="Stopping...", foreground="#f39c12")
+            self.status_label.configure(text="Stopping...", foreground=self.COLORS["warn"])
             self.stop_btn.configure(state="disabled")
 
     def _on_run(self):
@@ -1707,7 +3415,8 @@ class App(tk.Tk):
         if not output:
             messagebox.showerror("Error", "Please specify an output file path")
             return
-        if not keyword:
+        auto_match = self.auto_match_var.get()
+        if not keyword and not auto_match:
             messagebox.showerror("Error", "Please enter a folder keyword (e.g. WZP)")
             return
 
@@ -1740,30 +3449,39 @@ class App(tk.Tk):
                 import pillow_heif
                 pillow_heif.register_heif_opener()
 
-                injected, img_count, no_folder, errors = run_injection(
+                result = run_injection(
                     docx, sn_root, output,
                     keyword=keyword,
                     sn_row_col=self.sn_row_col, img_row_col=self.img_row_col,
                     auto_rotate=self.auto_rotate_var.get(),
                     smart_rotate=self.smart_rotate_var.get(),
+                    max_image_px=INSERT_MAX_PX if self.shrink_photos_var.get() else 0,
                     start_table=start_table,
                     selected_models=selected_models,
+                    auto_match=auto_match,
+                    photo_ocr=self.photo_ocr_var.get(),
+                    set_number_fallback=self.set_fallback_var.get(),
                     log_callback=self._log,
                     progress_callback=self._update_progress,
                     cancel_event=self._cancel_event
                 )
+                injected, img_count, no_folder, errors = result
+                summary_file = result.get("summary_path")
 
                 def finish():
                     self._set_running(False)
+                    self._last_summary = summary_file
+                    if summary_file and os.path.isfile(summary_file):
+                        self.summary_btn.configure(state="normal", bg=self.COLORS["soft"])
                     cancelled = self._cancel_event.is_set()
                     if cancelled:
                         self.status_label.configure(
                             text=f"Cancelled: {injected} tables saved before stop",
-                            foreground="#f39c12")
+                            foreground=self.COLORS["warn"])
                     elif errors:
                         self.status_label.configure(
                             text=f"Done: {injected} tables, {img_count} images, {len(errors)} error(s)",
-                            foreground=self.COLORS["accent"])
+                            foreground=self.COLORS["btn_stop"])
                     else:
                         self.status_label.configure(
                             text=f"Done: {injected} tables, {img_count} images inserted",
@@ -1787,6 +3505,72 @@ class App(tk.Tk):
 # ─────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────
+def cli_main(argv: list[str]) -> int:
+    """
+    Headless run (Auto mode), e.g. for batch jobs or testing the built .exe:
+      app.exe --cli --docx DOC.docx --photos PHOTO_ROOT --out OUT.docx [--log run.log]
+              [--no-ocr] [--no-set-fallback] [--no-smart-rotate] [--start-table N]
+    The windowed .exe has no console, so use --log to see progress. Exit code 0 = images injected.
+    """
+    import argparse
+    p = argparse.ArgumentParser(prog="Unit_Test_Image_Injector --cli")
+    p.add_argument("--cli", action="store_true")
+    p.add_argument("--docx", required=True)
+    p.add_argument("--photos", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--log")
+    p.add_argument("--start-table", type=int, default=1)
+    p.add_argument("--no-ocr", action="store_true")
+    p.add_argument("--no-set-fallback", action="store_true")
+    p.add_argument("--no-smart-rotate", action="store_true")
+    p.add_argument("--original-size", action="store_true", help="embed photos without shrinking")
+    p.add_argument("--workers", type=int, default=None)
+    args = p.parse_args(argv)
+
+    import time
+    log_file = open(args.log, "w", encoding="utf-8") if args.log else None
+    t0 = time.time()
+
+    def log(msg):
+        line = f"[{time.time() - t0:7.1f}s] {msg}"
+        if log_file:
+            log_file.write(line + "\n")
+            log_file.flush()
+        else:
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+
+    try:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except Exception:
+            pass
+        res = run_injection(args.docx, args.photos, args.out, auto_match=True,
+                            photo_ocr=not args.no_ocr, set_number_fallback=not args.no_set_fallback,
+                            start_table=args.start_table, auto_rotate=True,
+                            smart_rotate=not args.no_smart_rotate,
+                            max_image_px=0 if args.original_size else INSERT_MAX_PX,
+                            workers=args.workers, log_callback=log)
+        if res.get("summary_path"):
+            log(f"SUMMARY {res['summary_path']}")
+        log(f"RESULT injected={res.injected} images={res.img_count} "
+            f"no_folder={res.no_folder} errors={len(res.errors)}")
+        return 0 if res.injected > 0 else 1
+    except Exception as e:
+        import traceback
+        log(f"FATAL: {e}\n{traceback.format_exc()}")
+        return 2
+    finally:
+        cleanup_temp_files()
+        if log_file:
+            log_file.close()
+
+
 if __name__ == "__main__":
+    if "--cli" in sys.argv[1:]:
+        sys.exit(cli_main(sys.argv[1:]))
     app = App()
     app.mainloop()

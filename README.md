@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.5.0-orange)
+![Version](https://img.shields.io/badge/Version-1.6.0-orange)
 ![OCR](https://img.shields.io/badge/OCR-OpenThai2.0--OCR--Text-purple)
 
 ## Overview
@@ -14,6 +14,8 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ### Key Features
 
+- **Auto Mode (new in v1.6.0)** — Finds the Serial Number anywhere in each table and picks the photo cell by itself. No keyword or layout setup, and it works with different table layouts in the same document
+- **Read S/N from Photos (OCR)** — Photos don't even need S/N folders: drop them into one folder and the app reads the S/N on each box label and groups the photos per device
 - **Dynamic Table Layout** — Automatically read the Word document so you can visually select where the S/N and Image cells are. No hardcoded formats!
 - **Auto-match by Serial Number** — Folders named by S/N (e.g., `WZP301w123/`) are matched to the corresponding table in the Word document
 - **HEIC Support** — iPhone `.heic` photos are automatically converted to JPG
@@ -24,7 +26,7 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ## Quick Start
 
-### Option 1: Run with Python (Recommended for v1.5.0+)
+### Option 1: Run with Python (Recommended for v1.6.0+)
  
 Since v1.4.0 the Smart Rotate / MAC scanner OCR runs on **[OpenThai2.0-OCR-Text](https://huggingface.co/iapp/OpenThai2.0-OCR-Text)** — a ~4 MB Thai + English OCR model that runs on the **CPU only** (no GPU, no PyTorch). Setup is now a small download instead of 3 GB. The model files ship in `models/OpenThai2.0-OCR-Text/` and are re-downloaded from Hugging Face automatically if missing.
 
@@ -80,6 +82,19 @@ Photo_Root/
     └── ...
 ```
 
+Since v1.6.0 **Auto mode** also accepts these layouts:
+
+```
+Photo_Root/                                  Photo_Root/
+└── AirEngine8776-X7-T/                      ├── 1794893608341.jpg   ← box label (S/N readable)
+    ├── By_SN/                               ├── 1794893608365.jpg   ← device photo
+    │   ├── 21599990000GS0000208/            ├── 1794893608409.jpg   ← next box label
+    │   │   ├── IMG_0001.jpg                 └── ...
+    │   │   └── IMG_0002.jpg
+    │   └── ...                              (no S/N folders: S/N is read by OCR,
+    └── By_Number/195-280/  ← ignored         see "Auto Mode" below)
+```
+
 ### Step 2: Launch the App
 
 ![App Screenshot](https://img1.pic.in.th/images/Screenshot-2026-05-29-195205.md.png)
@@ -94,6 +109,9 @@ Photo_Root/
 | **Keyword** | Folder prefix to match (default: `WZP`, change as needed) |
 | **💾 Output File** | Where to save the result (default: `unit_test_with_images.docx`) |
 | **Auto-Rotate (EXIF)** | Check to use the basic camera orientation data. |
+| **Auto-match S/N (scan whole table)** | **On by default.** Finds the S/N in any cell of each table and detects the photo cell. Keyword and S/N/Image cell settings are not needed (see [Auto Mode](#auto-mode-v160)). Turn off to use the keyword + configured layout. |
+| **↳ Read S/N from photos (OCR)** | **On by default** (Auto mode only). Photos in a folder that isn't named by a serial are OCR'd for the S/N on the label. Folders already named by S/N are not OCR'd. |
+| **↳ Fallback: match ชุดที่ to folders like 12-280** | **On by default** (Auto mode only). Tables that still have no photos after S/N matching are filled from set-number folders, using the document's `ชุดที่ : N/T` (see [ชุดที่ fallback](#ชุดที่-set-number-fallback)). |
 | **Smart Rotate (OpenThai OCR · CPU)** | **Highly recommended.** Reads the text in each photo with OpenThai2.0-OCR-Text and rotates it 90°/180°/270° so it reads left-to-right. Required if you take sideways photos of wide devices (like IP Phones). |
 
 ### Step 4: Run
@@ -108,6 +126,57 @@ Click **▶ Run Injection** and watch the progress:
 ### Step 5: Stop (Optional)
 
 Click **■ Stop** at any time to cancel. Any images already inserted will be saved to the output file.
+
+## Auto Mode (v1.6.0)
+
+Auto mode lets you pick only the Word document and the photo folder. Everything else is found automatically.
+
+### How serials are matched
+- Every cell of every table (from **Start Table** on) is checked against the photo folder names.
+- Case, spaces and dashes are ignored: `wzp-301 000` matches folder `WZP301000`.
+- A serial inside text is found (`S/N: WZP301000`), and folders with extra words work (`Core2 10299X000016`).
+- Partial serials never match (`WZP3010001` ≠ `WZP301000`).
+
+### How the photo cell is found
+Rows below the S/N are searched in this order:
+1. The first empty row merged into one cell, or one that already holds a picture
+2. The empty row under a short `รูป` / `ภาพ` / `Photo` / `Picture` label
+3. The Image cell from **Configure Layout**, but only if it is empty
+
+If none fits, the table is skipped (`[SKIP]`). Text is never overwritten.
+
+### Summary tables are skipped
+Tables that list many devices (e.g. `ลำดับ | Part Number | Description | Serial Number`) are detected and skipped, even if only one of their serials has photos.
+
+### Read S/N from photos (OCR)
+When photos are not sorted into S/N folders (e.g. all photos in one folder named by timestamp):
+1. The serial numbers labelled in the document (`Serial Number:`, `S/N:` or a *Serial Number* column) are collected.
+2. Each photo is OCR'd (~0.4 s per photo on CPU). A unique match within 2 wrong characters is accepted, e.g. `215O08847...` read with a letter **O** still matches.
+3. Photos are put in **shooting order** using the EXIF capture time (file names may be out of order, e.g. renamed copies).
+4. A photo with no readable S/N (a wide shot of the device) goes to the device it was **shot closest to in time**. A device's photos are taken seconds apart and different devices are usually minutes apart, so each run of unread photos is split at its largest time gap. The **label can be shot before or after** the device photos, and the order can differ from device to device. A photo shot more than **90 s** away from the device's other photos (e.g. another device whose label can't be read) is **not** attached to anything. It is listed under "photo(s) without a readable S/N" so you can place it yourself.
+5. Without EXIF times (e.g. screenshots or edited images), file-name order is used and unread photos are shared so that each device gets the usual number of photos. Both label-first and device-first work, as long as the whole set is shot the same way.
+
+The log warns when a serial gets an unusual number of photos (e.g. 4 instead of 2, meaning the next label wasn't readable), when a serial appears in non-adjacent photos, and when photos have no serial. Check those devices in the output.
+
+### ชุดที่ (set number) fallback
+For photo folders named by set number instead of S/N, e.g. `AirEngine8776-X7-T/By_Number/12-280/`:
+1. Each detail table's `ชุดที่ : N/T`, `Part Number:` and `รายการ:` are read. Tables with the same Part Number form one device group.
+2. When a group is split into sections in the document (e.g. `1/229 … 229/229` then `1/51 … 51/51`, same Part Number), it is numbered continuously, so folder `230-280` = section 2, `1/51`.
+3. Each model folder is matched to a device group by **total** (280 = 229 + 51, or one section's total) and by **name**: the folder name is compared with the Description from the summary table (`AirEngine8776-X7-T` ≈ `AirEngine8776-X7T-T`). If no name fits, a total that only one group has is accepted.
+4. If several groups fit and none clearly by name (e.g. many 1-unit groups), the folder is **skipped with a log line instead of guessed**.
+
+S/N always wins. A table already matched by an S/N folder or by OCR never takes set-folder photos, and the log says `N already matched by S/N`. Use this only when no S/N is available: if whoever named the folders counted differently from the document, photos land on the wrong device.
+
+### Example log
+```
+OCR: reading S/N labels in 200 photo(s) from 1 folder(s) not named by serial (all)
+    Shooting order: EXIF capture time
+    84 photo(s) without readable S/N assigned by time gap
+  OCR grouped 200 photo(s) into 100 serial(s) (usually 2 per serial)
+  [SKIP] table 41: 78 serials in one table (summary/list table?)
+  [FIND] 21599990000GS0000208 (table 240): S/N at R4C2 -> photo at R5C1 (empty merged row)
+  Auto mode: 100/100 folder(s) matched, 2 table(s) skipped
+```
 
 ## How to Configure Table Layout
 
@@ -142,11 +211,21 @@ The app natively parses the first table in your Word document and displays it in
 # Install PyInstaller
 pip install pyinstaller
 
-# Build standalone executable
-python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector" app.py
+# Build standalone executable (bundles the OpenThai OCR model + its runtime imports)
+python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.0" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
 ```
 
-The `.exe` will be created at `dist/Unit_Test_Image_Injector.exe`
+The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.0.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
+
+### Command-line (batch) mode
+
+The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
+
+```bash
+Unit_Test_Image_Injector_v1.6.0.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
+```
+
+Options: `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
 
 ## Requirements
 
@@ -183,7 +262,18 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
-### v1.5.0 (Current)
+### v1.6.0 (Current)
+- 🔎 **Auto Mode** — Matches the S/N anywhere in each table and detects the photo cell automatically. Summary tables are skipped and `[FIND]` log lines show which cells were used.
+- 📂 **Nested Folder Scan** — Finds S/N folders at any depth (`Model/By_SN/<serial>/`), ignores `195-280` sequence folders, and includes photos in the selected folder itself.
+- 📷 **Read S/N from Photos (OCR)** — Groups unsorted photos per device by reading the S/N on the box label, tolerating small OCR errors. Unread photos go to the device shot closest in time (EXIF), so the label can be shot before or after the device photos.
+- 🔢 **ชุดที่ Fallback** — Fills tables with no S/N match from set-number folders (`12-280`), numbering across document sections and matching model folders by name and total.
+- ⚡ **3.6× Faster, 5× Smaller Output** — Photos shrunk to 2000 px and prepared in parallel, and python-docx's O(n²) image hashing fixed (669 photos: 15.4 → 4.3 min, 1.58 GB → 335 MB).
+- 🖥 **Command-line Mode** — `--cli` for batch runs and testing the exe.
+- 📄 **Run Summary Report** — `<output>_summary.txt` per device group: with photos / partial / missing (with reason), duplicate S/N in the document, folders not in the document, unreadable photos.
+- 🏷 **Box Stickers & Small Labels** — reads set-number stickers (`31/100`) and zooms into small S/N labels.
+- ✅ 23 new tests (`test/test_auto_match.py`).
+
+### v1.5.0
 - 📑 **Starting Table / Page Selection** — Choose which table index (1-based) to start injecting from, skipping cover/revision/summary tables automatically.
 - 🧭 **Multi-Table Layout Picker** — Navigate across any table in the `.docx` (`◀ Previous`, `Next ▶`, or `Table X of N` dropdown) inside **Configure Table Layout** to map S/N and Image cells.
 - 🏷 **Auto Device Model Detection & Filter** — Automatically detects device models across Cisco, Huawei, and TP-Link documents/folders (including `Part Number` ➔ `Description` summary mapping) with a multi-select checklist in the GUI.
