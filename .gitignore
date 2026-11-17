@@ -18,6 +18,8 @@ __pycache__/
 *.bmp
 *.tiff
 *.tif
+# README screenshots (made from demo data only)
+!docs/*.png
 
 # Word documents (user data)
 *.docx
@@ -26,6 +28,7 @@ __pycache__/
 *.xlsx
 
 # Output
+*_summary.txt
 matched_results.txt
 ocr_matched_files/
 *.zip

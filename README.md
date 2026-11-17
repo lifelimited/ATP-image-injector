@@ -22,11 +22,17 @@ This tool automates the process of inserting device photos into Unit Test Word d
 - **Customizable Keyword** — Change the folder prefix from `WZP` to any keyword to match your project
 - **Stop Button** — Cancel processing at any time; partial progress is saved
 - **Portable** — Standalone `.exe` file, no Python installation required
-- **Dark Theme UI** — Modern, clean interface with progress tracking and color-coded logs
+- **Clean, Easy UI** — Light theme with one meaning per colour, sharp on high-DPI screens, color-coded log, built-in Thai guide (❓ วิธีใช้)
 
 ## Quick Start
 
-### Option 1: Run with Python (Recommended for v1.6.0+)
+### Option 1: Windows .exe (easiest, no install)
+
+1. Download **`Unit_Test_Image_Injector_v1.6.0.exe`** from the [latest release](../../releases/latest) (~148 MB; OCR model included, no Python needed).
+2. Double-click to run. Windows SmartScreen may ask once: *More info → Run anyway*.
+3. Pick the Word document and the photo folder, then click **▶ Run Injection**. Click **❓ วิธีใช้** for the Thai guide.
+
+### Option 2: Run with Python
  
 Since v1.4.0 the Smart Rotate / MAC scanner OCR runs on **[OpenThai2.0-OCR-Text](https://huggingface.co/iapp/OpenThai2.0-OCR-Text)** — a ~4 MB Thai + English OCR model that runs on the **CPU only** (no GPU, no PyTorch). Setup is now a small download instead of 3 GB. The model files ship in `models/OpenThai2.0-OCR-Text/` and are re-downloaded from Hugging Face automatically if missing.
 
@@ -38,14 +44,7 @@ Since v1.4.0 the Smart Rotate / MAC scanner OCR runs on **[OpenThai2.0-OCR-Text]
 1. Double-click `setup_mac.command` to install dependencies and create a local virtual environment. (You only need to do this once).
 2. Double-click `run_mac.command` to launch the app!
 
-For a massive EXE file download https://drive.google.com/file/d/1DP1b5245Kz_tljlczBh7rCKrCpvGjelG/view?usp=sharing
-
-
-### Option 2: Run the .exe (Legacy / EXIF-only)
-
-1. Download `Unit_Test_Image_Injector_v1.2.1.exe` from the [Releases](../../releases) page
-2. Double-click to run (Contains EXIF rotation but NO Smart OCR rotation)
-3. Select your files and click **▶ Run Injection**
+Older builds (e.g. the legacy v1.2.1 EXIF-only exe) remain on the [Releases](../../releases) page.
 
 ### Option 3: Run from Python Manually (Command Line)
 
@@ -97,33 +96,70 @@ Photo_Root/                                  Photo_Root/
 
 ### Step 2: Launch the App
 
-![App Screenshot](https://img1.pic.in.th/images/Screenshot-2026-05-29-195205.md.png)
+![App Screenshot](docs/app_main.png)
+
+*Main window after a run (demo data). Green = run / success, red = stop / errors, blue = buttons / selection, amber = warnings.*
+
+Click **❓ วิธีใช้** (top right) for the built-in Thai usage guide:
+
+![Built-in Thai usage guide](docs/help_guide.png)
 
 ### Step 3: Configure
 
 | Field | Description |
 |-------|-------------|
-| **📝 Word Document** | Select your Unit Test `.docx` template. **A pop-up will appear** letting you visually select the S/N cell and Image cell. |
-| **⚙️ Configure Layout** | Click this to re-open the table grid layout and change your selected cell mappings. |
-| **📁 SN Folders Directory** | Select the parent folder containing all `WZP*` subfolders |
-| **Keyword** | Folder prefix to match (default: `WZP`, change as needed) |
-| **💾 Output File** | Where to save the result (default: `unit_test_with_images.docx`) |
-| **Auto-Rotate (EXIF)** | Check to use the basic camera orientation data. |
-| **Auto-match S/N (scan whole table)** | **On by default.** Finds the S/N in any cell of each table and detects the photo cell. Keyword and S/N/Image cell settings are not needed (see [Auto Mode](#auto-mode-v160)). Turn off to use the keyword + configured layout. |
-| **↳ Read S/N from photos (OCR)** | **On by default** (Auto mode only). Photos in a folder that isn't named by a serial are OCR'd for the S/N on the label. Folders already named by S/N are not OCR'd. |
-| **↳ Fallback: match ชุดที่ to folders like 12-280** | **On by default** (Auto mode only). Tables that still have no photos after S/N matching are filled from set-number folders, using the document's `ชุดที่ : N/T` (see [ชุดที่ fallback](#ชุดที่-set-number-fallback)). |
-| **Smart Rotate (OpenThai OCR · CPU)** | **Highly recommended.** Reads the text in each photo with OpenThai2.0-OCR-Text and rotates it 90°/180°/270° so it reads left-to-right. Required if you take sideways photos of wide devices (like IP Phones). |
+| **📄 Word Document** | Select your Unit Test `.docx`. With Auto-match on (default) nothing else needs to be set up. |
+| **⚙ Configure Layout** | Only for the classic mode (Auto-match off): pick the S/N cell and the Image cell visually. **Start Table** skips cover / summary pages. |
+| **📁 Photos Folders Directory** | The top folder holding all photos: S/N folders at any depth, one flat folder of photos (read by OCR), or set-number folders (`12-280`). |
+| **Keyword** | Classic mode only: folder prefix to match (e.g. `WZP`). Greyed out while Auto-match is on. |
+| **🏷 Device Models Filter** | Untick models you do not want to inject. |
+| **💾 Output File** | Where to save the result. A `<output>_summary.txt` report is written next to it. |
+| **📷 Auto-Rotate (EXIF)** | Uses the camera orientation data. |
+| **📷 Smart Rotate (OCR)** | Reads the text in each photo with OpenThai2.0-OCR-Text and rotates it 90°/180°/270° upright. |
+| **📷 Shrink photos to 2000px** | **On by default.** ~5× smaller and much faster `.docx`, still ~360 dpi at 14 cm. Untick to embed original photos. |
+| **🔎 Auto-match S/N in tables** | **On by default.** Finds the S/N in any cell of each table and detects the photo cell (see [Auto Mode](#auto-mode-v160)). |
+| **🔎 Read S/N from photos (OCR)** | **On by default.** Photos in a folder that isn't named by a serial are OCR'd: the S/N label (zooming into small labels) or the box's set-number sticker (`31/100`). |
+| **🔎 Fallback: ชุดที่ folders (12-280)** | **On by default.** Tables still without photos are filled from set-number folders using the document's `ชุดที่ : N/T` (see [ชุดที่ fallback](#ชุดที่-set-number-fallback)). |
 
 ### Step 4: Run
 
 Click **▶ Run Injection** and watch the progress:
 
 - 🟢 `[OK  ]` — Image inserted successfully
-- 🔵 `[SKIP]` — No matching table found in the document
-- 🔴 `[ERR ]` — Error inserting image
-- 🟡 `[CANCELLED]` — Stopped by user (partial save)
+- ⚪ `[FIND]` / `[SET ]` / `[SKIP]` — S/N found, set-number folder used, table skipped (e.g. summary table)
+- 🟡 `[WARN]` — Check this (unusual photo count, unreadable photos, same S/N twice in the document …)
+- 🔴 `[ERR ]` / `ERROR` — Error inserting image
+- 🟠 `[CANCELLED]` — Stopped by user (partial save)
 
-### Step 5: Stop (Optional)
+### Step 5: Check the Summary
+
+Click **📄 Summary** (or open `<output>_summary.txt`). Per device group of the document it lists which units got photos, which have fewer photos than usual and which have none, with the reason (example from the demo data):
+
+```
+1. AirEngine8776-X7T-T (Part Number 50088471) (Total: 6 Units)
+----------------------------------------------------------------------
+- With photos: 6 unit(s) (usually 2 photos each)
+- Partial (fewer photos than usual): 1 unit(s)
+  ชุดที่      | Serial Number         | Photos
+  ------------|-----------------------|-------
+  3/6         | 21599990000GS0000103  | 1
+
+2. S5755-H24UM4Y2CZ (Part Number 98012636-003) (Total: 4 Units)
+----------------------------------------------------------------------
+- With photos: 3 unit(s) (usually 2 photos each)
+- Missing photos: 1 unit(s)
+  ชุดที่      | Serial Number         | Reason
+  ------------|-----------------------|------------------------------
+  4/4         | 4E9990000104          | photo folder is empty (0 files)
+
+3. TPLINK ARCHER-TBE400E (Part Number 152502547) (Total: 4 Units)
+----------------------------------------------------------------------
+- All 4 units have photos (2 each)
+```
+
+It also lists S/N repeated in several document tables, photo folders not in the document, photos whose S/N could not be read, and all warnings.
+
+### Stop (Optional)
 
 Click **■ Stop** at any time to cancel. Any images already inserted will be saved to the output file.
 
