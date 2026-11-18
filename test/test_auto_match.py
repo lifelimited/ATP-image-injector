@@ -382,6 +382,34 @@ def test_run_injection_skips_ocr_in_other_serial_folders(tmp_path, monkeypatch):
     assert "2 photo(s) from 1 folder(s)" in text
 
 
+def test_run_injection_skips_ocr_in_model_folders_not_in_document(tmp_path, monkeypatch):
+    doc = Document()
+    t = doc.add_table(rows=4, cols=2)
+    t.rows[0].cells[0].text = "Serial Number:"
+    t.rows[0].cells[1].text = "AAA1234567"
+    t.rows[1].cells[0].text = "Part Number:"
+    t.rows[1].cells[1].text = "CP-8841-K9="
+    _merged_empty_row(t, 3)
+    p = tmp_path / "doc.docx"
+    doc.save(str(p))
+    root = tmp_path / "root"
+    _photo(str(root / "7821" / "photos_a" / "1.png"), (0, 0, 255))
+    _photo(str(root / "7821" / "photos_a" / "2.png"), (0, 0, 255))
+    _photo(str(root / "8841" / "photos_b" / "3.png"), (255, 0, 0))
+    eng = _FakeEngine({(255, 0, 0): ["S/N: AAA1234567"], (0, 0, 255): ["S/N: AAA1234567"]})
+    import ocr_engine
+    monkeypatch.setattr(ocr_engine, "get_engine", lambda *a, **k: eng)
+    logs = []
+    res = app.run_injection(str(p), str(root), str(tmp_path / "out.docx"), auto_match=True,
+                            photo_ocr=True, auto_rotate=False, smart_rotate=False,
+                            log_callback=logs.append)
+    text = "\n".join(logs)
+    assert "Skipping OCR in 1 folder(s) of model(s) not in this document / not selected: 7821" in text
+    assert "1 photo(s) from 1 folder(s)" in text
+    assert res.injected == 1 and not res.errors
+    assert _count_pictures(Document(str(tmp_path / "out.docx")).tables[0]) == 1   # 8841 photo only
+
+
 # ── ชุดที่ (set number) fallback ──
 
 def _detail_table(doc, item, n, total, pn, sn):

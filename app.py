@@ -882,6 +882,35 @@ def _folder_named_like_other_serial(name: str, doc_serials) -> bool:
     return all(_levenshtein(key, k) > 2 for k in doc_serials)
 
 
+def _ocr_skip_model_folders(names, sn_to_model: dict, sn_root: str, doc, active_models=None) -> set:
+    """
+    Folders (by name) whose device-model folder is not in the document, or was unticked in the
+    Device Models filter, so their photos are not OCR'd. Skips only when model matching is known
+    to work for this document: at least one model folder of the photo root matches a document model.
+    """
+    folder_models = set(detect_folder_models(sn_root))
+    if not folder_models:
+        return set()
+    pn_to_desc = extract_doc_part_descriptions(doc)
+    doc_models = {m for t in doc.tables for m in extract_table_models(t, pn_to_desc=pn_to_desc)}
+
+    def in_doc(fm):
+        return any(model_matches(fm, dm) or model_matches(dm, fm) for dm in doc_models)
+
+    if not any(in_doc(fm) for fm in folder_models):
+        return set()
+    skip = set()
+    for n in names:
+        fm = sn_to_model.get(n)
+        if fm not in folder_models:
+            continue
+        if not in_doc(fm) or (active_models is not None
+                              and not any(model_matches(sel, fm) or model_matches(fm, sel)
+                                          for sel in active_models)):
+            skip.add(n)
+    return skip
+
+
 def find_serial_in_ocr_lines(lines: list[str], doc_serials: dict[str, str]) -> tuple[str | None, str]:
     """
     Pick the document serial printed in a photo from its OCR lines.
@@ -1751,6 +1780,12 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
         doc = Document(docx_path)
         doc_serials = extract_doc_serials(doc)
         unnamed = [name for name in sorted(sn_folders) if normalize_sn(name) not in doc_serials]
+        model_skip = _ocr_skip_model_folders(unnamed, sn_to_model, sn_root, doc, active_models)
+        if model_skip:
+            skipped_models = sorted({str(sn_to_model.get(n)) for n in model_skip})
+            unnamed = [n for n in unnamed if n not in model_skip]
+            log("\n  Skipping OCR in %d folder(s) of model(s) not in this document / not selected: %s"
+                % (len(model_skip), ", ".join(skipped_models)))
         other_serial = [n for n in unnamed if _folder_named_like_other_serial(n, doc_serials)]
         if other_serial:
             skip = set(other_serial)
