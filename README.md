@@ -308,6 +308,7 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 ## Changelog
 
 ### v1.7.0-beta.3 (Pre-release)
+- ⏱ **Time left while running** — the status shows the current step and an estimate (`Inserting photos... 61/129 · about 35 s left`); within ±10% of the run time from 30% on in real-data tests once the speeds of the computer are learned.
 - ⏳ Loading popup when a document / photo folder is picked (no frozen window), also in v1.6.1.
 
 ### v1.7.0-beta.2 (Pre-release)

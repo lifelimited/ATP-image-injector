@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ## [1.7.0-beta.3] - 2026-11-18 (pre-release)
+### Added
+- **Time left while running**: the status next to Stop shows the step and an estimate, e.g. `Reading S/N from photos... 84/129 · about 50 s left` / `Inserting photos... 61/129 · about 35 s left`, and the progress bar follows the whole run (it only moves forward). New `eta.py` (`EtaTracker`): each step (Read S/N OCR, Verify OCR, preparing/inserting photos, saving, summary) is planned up front; the time left is the remaining work of the current step at its recent speed (blended with the learned speed while little is done) plus the planned work of the steps still to come at their learned speeds. Speeds are learned per computer in `%LOCALAPPDATA%\UnitTestImageInjector\eta_stats.json`. `run_injection(..., eta_callback=, eta_stats_path=)`.
+  - Measured on 5 real photo sets (27 s – 3 min runs, 48–558 photos): from 30% of the run on, the estimate was within ±10% of the run time at 19 of 20 points once the speeds were learned (worst +14%), and at 14 of 16 points on the very first run (worst +24% on a 28 s run).
+### Fixed
+- Smart Rotate could switch itself off when run from source: the photo-preparation threads imported the OCR runtime at the same moment (`partially initialized module`), and the first failure disabled Smart Rotate for the rest of the session. The import is now locked (`ocr_engine._load_runtime`). The built exe was not affected in tests.
 ### Fixed
 - **The window no longer freezes while a document or photo folder is loaded.** Picking a .docx opened it up to 5 times on the UI thread (a 613-table document with photos takes ~8 s per open). It is now read once in the background with a small *Loading...* popup (file name and a moving bar, shown only when loading takes over 0.3 s), and the opened document is cached for the table count, device models and Configure Layout (`open_docx_readonly()`), which now opens instantly.
 
