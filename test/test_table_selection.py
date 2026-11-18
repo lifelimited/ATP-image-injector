@@ -388,3 +388,32 @@ def test_app_gui_dynamic_model_filtering_and_merging(tmp_path, headless_root):
     # Select all
     main_app._select_all_models()
     assert all(var.get() for var in main_app.model_vars.values())
+
+
+def test_file_scan_runs_in_background_and_updates_ui(headless_root, tmp_path):
+    """Selecting a document/folder reads it in a worker thread; the UI is updated when done."""
+    import time
+    import docx as _docx
+    docx_file = tmp_path / "bg.docx"
+    doc = _docx.Document()
+    for _ in range(4):
+        t = doc.add_table(rows=6, cols=4)
+        t.rows[2].cells[0].text = "Name : CP-7821-K9="
+    doc.save(str(docx_file))
+    photo_root = tmp_path / "photos_bg" / "8865"
+    photo_root.mkdir(parents=True)
+    (photo_root / "a.jpg").write_bytes(b"dummy")
+
+    app_ = headless_root
+    called = []
+    app_.sn_root_var.set(str(photo_root.parent))
+    app_._start_file_scan("test", then=lambda: called.append(True))
+    app_.docx_var.set(str(docx_file))            # newer scan replaces the first one
+    deadline = time.time() + 15
+    while time.time() < deadline and not ("CP-7821-K9=" in app_.model_vars and "(of 4)" in app_.total_tables_label.cget("text")):
+        app_.update()
+        time.sleep(0.02)
+    assert "(of 4)" in app_.total_tables_label.cget("text")
+    assert "CP-7821-K9=" in app_.model_vars and "8865" in app_.model_vars
+    assert called == [True]                       # 'then' runs once, after the newest scan
+    assert getattr(app_, "_busy_win", None) is None
