@@ -267,6 +267,41 @@ def test_group_photos_label_then_wide_shot(tmp_path):
     assert unassigned == []
 
 
+def test_group_photos_stops_at_first_label_per_device_folder(tmp_path):
+    """Per-device folders: reading stops at the first exact S/N label; a flat folder reads everything."""
+    ser = {"AAA1234567": "AAA1234567", "BBB7654321": "BBB7654321"}
+    reads = []
+
+    class _Counting(_FakeEngine):
+        def read(self, img):
+            reads.append(img.getpixel((0, 0)))
+            return super().read(img)
+
+    eng = _Counting({(255, 0, 0): ["S/N: AAA1234567"], (0, 0, 255): ["S/N: BBB7654321"]})
+    a, b = str(tmp_path / "dev1"), str(tmp_path / "dev2")
+    imgs = [_photo(os.path.join(a, "1.png"), (255, 0, 0)),   # label A first
+            _photo(os.path.join(a, "2.png"), (0, 255, 0)),
+            _photo(os.path.join(a, "3.png"), (0, 255, 0)),
+            _photo(os.path.join(b, "4.png"), (0, 0, 255)),   # label B first
+            _photo(os.path.join(b, "5.png"), (0, 255, 0)),
+            _photo(os.path.join(b, "6.png"), (0, 255, 0))]
+    logs = []
+    groups, unassigned = app.group_photos_by_ocr(imgs, ser, engine=eng, log_cb=logs.append)
+    assert [os.path.basename(p) for p in groups["AAA1234567"]] == ["1.png", "2.png", "3.png"]
+    assert [os.path.basename(p) for p in groups["BBB7654321"]] == ["4.png", "5.png", "6.png"]
+    assert unassigned == []
+    assert (0, 255, 0) not in reads                       # device shots never OCR'd
+    assert any("4 photo(s) not OCR'd" in m for m in logs)
+
+    # One flat folder (devices mixed): every photo is read
+    reads.clear()
+    d = str(tmp_path / "all")
+    flat = [_photo(os.path.join(d, "1.png"), (255, 0, 0)), _photo(os.path.join(d, "2.png"), (0, 255, 0)),
+            _photo(os.path.join(d, "3.png"), (0, 0, 255)), _photo(os.path.join(d, "4.png"), (0, 255, 0))]
+    app.group_photos_by_ocr(flat, ser, engine=eng)
+    assert reads.count((0, 255, 0)) >= 2
+
+
 def test_assign_unread_device_photo_first_by_count():
     """Device photo shot BEFORE its label, no times: still grouped correctly."""
     seq = [("u1", None), ("A", "A"), ("u2", None), ("B", "B"), ("u3", None), ("C", "C")]
