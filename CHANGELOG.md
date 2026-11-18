@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Fixed
+- **Read S/N from photos no longer OCRs folders of other devices**: a folder named by a serial that is not in the document (e.g. a photo folder of every device of the project, used with a document of only some of them) was treated as "not named by serial" and every photo in it was OCR'd, about 4-5 s per photo. Such folders are now skipped and logged as `Skipping OCR in N folder(s) named by a serial that is not in this document` (`_folder_named_like_other_serial()`). A name within distance 2 of a document serial (a typo) is still OCR'd. Real data: 654 folders / 1,967 files, document with 43 serials: about 2 h+ of OCR → **21 s**, 43/43 tables filled.
 
 ## [1.7.0-beta] - 2026-11-18 (pre-release)
 ### Added

@@ -340,6 +340,48 @@ def test_run_injection_photo_ocr_flat_folder(tmp_path, monkeypatch):
     assert res2.injected == 0
 
 
+def test_folder_named_like_other_serial():
+    ser = {"AAA1234567": "AAA1234567", "BBB7654321": "BBB7654321"}
+    f = app._folder_named_like_other_serial
+    assert f("ZZZ9990001", ser)            # another device's S/N folder -> skip OCR
+    assert f("zzz-999-0001", ser)
+    assert not f("AAA1234567", ser)        # in the document
+    assert not f("AAA1234561", ser)        # typo of a document serial -> OCR may rescue it
+    assert not f("all", ser) and not f("photos", ser) and not f("195-280", ser)
+    assert not f("Photos20240115", ser)    # longer than any document serial
+    assert not f("Core2 ZZZ9990001", ser)  # several words
+    assert not f("20240115", ser)          # no letter (date folder)
+    assert not f("100APPLE", ser)
+    assert not f("ZZZ9990001", {})
+
+
+def test_run_injection_skips_ocr_in_other_serial_folders(tmp_path, monkeypatch):
+    doc = Document()
+    t = doc.add_table(rows=3, cols=2)
+    t.rows[0].cells[0].text = "Serial Number:"
+    t.rows[0].cells[1].text = "AAA1234567"
+    _merged_empty_row(t, 2)
+    p = tmp_path / "doc.docx"
+    doc.save(str(p))
+    root = tmp_path / "root"
+    _photo(str(root / "all" / "1.png"), (255, 0, 0))
+    _photo(str(root / "all" / "2.png"), (0, 255, 0))
+    for i in range(3):
+        _photo(str(root / "ZZZ999000" / f"{i}.png"), (0, 0, 255))
+    eng = _FakeEngine({(255, 0, 0): ["S/N: AAA1234567"], (0, 0, 255): ["S/N: AAA1234567"]})
+    import ocr_engine
+    monkeypatch.setattr(ocr_engine, "get_engine", lambda *a, **k: eng)
+    logs = []
+    res = app.run_injection(str(p), str(root), str(tmp_path / "out.docx"), auto_match=True,
+                            photo_ocr=True, auto_rotate=False, smart_rotate=False,
+                            log_callback=logs.append)
+    assert res.injected == 1 and not res.errors
+    assert _count_pictures(Document(str(tmp_path / "out.docx")).tables[0]) == 2   # only 'all' photos
+    text = "\n".join(logs)
+    assert "Skipping OCR in 1 folder(s)" in text and "ZZZ999000" in text
+    assert "2 photo(s) from 1 folder(s)" in text
+
+
 # ── ชุดที่ (set number) fallback ──
 
 def _detail_table(doc, item, n, total, pn, sn):
