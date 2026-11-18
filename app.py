@@ -856,6 +856,32 @@ def _levenshtein(a: str, b: str, max_dist: float = 2.0) -> float:
     return prev[-1]
 
 
+_SERIAL_FOLDER_TOKEN_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_.]*$")
+
+
+def _folder_named_like_other_serial(name: str, doc_serials) -> bool:
+    """
+    True when a folder name is itself a serial number of a device that is NOT in this document
+    (e.g. a folder of every device of the project, used with a document of only some of them).
+    OCR-ing such folders cannot find a document serial and costs seconds per photo, so they are skipped.
+    A name close to a document serial (typo, distance <= 2) is not skipped: OCR may still rescue it.
+    """
+    raw = os.path.basename(str(name)).strip()
+    key = normalize_sn(raw)
+    if not doc_serials or key in doc_serials or not _SERIAL_FOLDER_TOKEN_REGEX.match(raw):
+        return False
+    if SEQ_FOLDER_REGEX.match(raw) or STRICT_CAMERA_DIR_REGEX.match(raw):
+        return False
+    letters = sum(ch.isalpha() for ch in key)
+    digits = sum(ch.isdigit() for ch in key)
+    if letters < 1 or digits < 3:
+        return False
+    lens = [len(k) for k in doc_serials]
+    if not (min(lens) - 2 <= len(key) <= max(lens) + 2):
+        return False
+    return all(_levenshtein(key, k) > 2 for k in doc_serials)
+
+
 def find_serial_in_ocr_lines(lines: list[str], doc_serials: dict[str, str]) -> tuple[str | None, str]:
     """
     Pick the document serial printed in a photo from its OCR lines.
@@ -1725,6 +1751,12 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
         doc = Document(docx_path)
         doc_serials = extract_doc_serials(doc)
         unnamed = [name for name in sorted(sn_folders) if normalize_sn(name) not in doc_serials]
+        other_serial = [n for n in unnamed if _folder_named_like_other_serial(n, doc_serials)]
+        if other_serial:
+            skip = set(other_serial)
+            unnamed = [n for n in unnamed if n not in skip]
+            log(f"\n  Skipping OCR in {len(other_serial)} folder(s) named by a serial that is not in this "
+                f"document ({', '.join(other_serial[:3])}{' ...' if len(other_serial) > 3 else ''})")
         if unnamed and doc_serials:
             ocr_imgs = [img for name in unnamed for img in sn_folders[name]]
             log(f"\nOCR: reading S/N labels in {len(ocr_imgs)} photo(s) from {len(unnamed)} folder(s) "
