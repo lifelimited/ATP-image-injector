@@ -1267,6 +1267,10 @@ def assign_unread_photos(seq: list[tuple[str, str | None]], times: list[float] |
     return groups, method
 
 
+OCR_GROUP_MAX_WORKERS = 4       # parallel OCR engines for Read S/N from photos
+OCR_EARLY_STOP_MAX_PHOTOS = 12  # per-device folder size up to which reading stops at the first S/N label
+
+
 def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=None,
                         log_cb=None, cancel_event=None, time_fn=None,
                         sticker_lookup: dict[int, list[dict]] | None = None
@@ -1286,28 +1290,98 @@ def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=N
         from ocr_engine import get_engine
         engine = get_engine(log_cb=log_cb)
     time_fn = time_fn or photo_capture_time
+    try:
+        from ocr_engine import OpenThaiEngine
+        parallel = isinstance(engine, OpenThaiEngine)  # one engine per worker thread (_worker_ocr_engine)
+    except Exception:
+        parallel = False
+    workers = max(1, min(OCR_GROUP_MAX_WORKERS, (os.cpu_count() or 2) // 2)) if parallel else 1
 
-    reads: list[tuple[str, str | None]] = []
-    sticker_reads: dict[str, str] = {}  # path -> 'N/T' for photos identified only by a set sticker
+    # Photos are read per folder. In per-device folders (several sibling folders, few photos each)
+    # reading stops at the first exact S/N label and the folder's other photos get that serial,
+    # which saves the slow failed reads of device shots. A single flat folder (all devices mixed)
+    # is always read photo by photo and unread photos are assigned by shooting time.
+    by_dir: dict[str, list[str]] = {}
+    for path in images:
+        by_dir.setdefault(os.path.dirname(path), []).append(path)
+    early_stop = len(by_dir) >= 2
+
+    def read_folder(paths, eng_fn):
+        out = []
+        stop = early_stop and len(paths) <= OCR_EARLY_STOP_MAX_PHOTOS
+        for k, path in enumerate(paths):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            try:
+                key, how = read_serial_from_photo(path, eng_fn(), doc_serials, sticker_lookup=sticker_lookup)
+                err = None
+            except Exception as e:
+                key, how, err = None, "", e
+            out.append((path, key, how, err))
+            if stop and key and how == "exact":
+                out.extend((p, None, "skipped", None) for p in paths[k + 1:])
+                break
+        return out
+
+    results: dict[str, tuple] = {}
     total = len(images)
-    for i, path in enumerate(images, start=1):
-        if cancel_event is not None and cancel_event.is_set():
-            break
+    progress = {"done": 0, "logged": 0}
+
+    def collect(rows):
+        for path, key, how, err in rows:
+            results[path] = (key, how)
+            if err is not None:
+                log(f"      [OCR ] {os.path.basename(path)}: cannot read ({err})")
+            elif key and "[sticker" in how:
+                log(f"    [WARN] {os.path.basename(path)}: label S/N {doc_serials[key]} but "
+                    f"{how.split('[', 1)[1].rstrip(']')} - check the sticker (S/N label used)")
+            elif key and how != "exact":
+                log(f"      [OCR ] {os.path.basename(path)} -> {doc_serials[key]} ({how})")
+        progress["done"] += len(rows)
+        done = progress["done"]
+        if done - progress["logged"] >= 20 or (done == total and progress["logged"] != total):
+            progress["logged"] = done
+            log(f"    OCR {done}/{total} photo(s)...")
+
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        log(f"    OCR with {workers} worker(s)")
+        pool = ThreadPoolExecutor(max_workers=workers)
         try:
-            key, how = read_serial_from_photo(path, engine, doc_serials, sticker_lookup=sticker_lookup)
-        except Exception as e:
-            key, how = None, ""
-            log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
-        reads.append((path, key))
-        if key and how.startswith("sticker"):
-            sticker_reads[path] = how.split()[1].replace("+zoom", "")
-        if key and "[sticker" in how:
-            log(f"    [WARN] {os.path.basename(path)}: label S/N {doc_serials[key]} but {how.split('[', 1)[1].rstrip(']')}"
-                " - check the sticker (S/N label used)")
-        elif key and how != "exact":
-            log(f"      [OCR ] {os.path.basename(path)} -> {doc_serials[key]} ({how})")
-        if i % 20 == 0 or i == total:
-            log(f"    OCR {i}/{total} photo(s)...")
+            futs = [pool.submit(read_folder, paths, _worker_ocr_engine) for paths in by_dir.values()]
+            for fut in as_completed(futs):
+                collect(fut.result())
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+    else:
+        for paths in by_dir.values():
+            collect(read_folder(paths, lambda: engine))
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+    skipped = sum(1 for _, how in results.values() if how == "skipped")
+    if skipped:
+        log(f"    {skipped} photo(s) not OCR'd: their folder's S/N label was already read")
+    # Per-device folders: a folder whose photos read exactly one serial gives it to its unread photos
+    # (the time-gap rule across all folders could hand them to the next folder's device).
+    folder_filled = 0
+    if early_stop:
+        for paths in by_dir.values():
+            keys = {results[p][0] for p in paths if p in results and results[p][0]}
+            if len(keys) == 1:
+                key = next(iter(keys))
+                for p in paths:
+                    if p in results and not results[p][0]:
+                        results[p] = (key, "folder")
+                        folder_filled += 1
+    if folder_filled:
+        log(f"    {folder_filled} photo(s) without a read S/N given to the S/N read in their folder")
+    reads: list[tuple[str, str | None]] = [(p, results[p][0]) for p in images if p in results]
+    sticker_reads: dict[str, str] = {  # path -> 'N/T' for photos identified only by a set sticker
+        p: how.split()[1].replace("+zoom", "") for p, (key, how) in results.items()
+        if key and how.startswith("sticker")}
 
     # Shooting order
     stamps = [time_fn(p) for p, _ in reads]
