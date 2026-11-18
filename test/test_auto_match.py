@@ -641,12 +641,24 @@ def test_verify_moves_whole_folder_including_unread(tmp_path, monkeypatch):
     root = tmp_path / "photos"
     _photo(str(root / "AAA1234567" / "1.png"), _BLUE)
     _photo(str(root / "AAA1234567" / "2.png"), _GREEN)    # unread wide shot follows the folder
-    _photo(str(root / "AAA1234567" / "3.png"), _GREY)
+    _photo(str(root / "AAA1234567" / "3.png"), _BLUE)     # 2 label photos of B -> whole folder is B
     res, d, logs = _run_verify(tmp_path, monkeypatch, root)
     assert _count_pictures(d.tables[0]) == 0 and _count_pictures(d.tables[1]) == 3
     text = open(res["summary_path"], encoding="utf-8-sig").read()
     assert "Photos moved (wrong folder) (3)" in text
     assert "showed another S/N (moved)" in text          # reason why table A has no photos
+
+
+def test_verify_single_label_photo_moves_alone(tmp_path, monkeypatch):
+    """A stray label photo of B next to an unreadable photo: only the label photo moves, the unreadable
+    photo may be the folder's own device and stays in table A."""
+    root = tmp_path / "photos"
+    _photo(str(root / "AAA1234567" / "1.png"), _BLUE)
+    _photo(str(root / "AAA1234567" / "2.png"), _GREEN)
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root)
+    assert _count_pictures(d.tables[0]) == 1 and _count_pictures(d.tables[1]) == 1
+    assert any("only 1 label photo" in line for line in logs)
+    assert "Photos moved (wrong folder) (1)" in open(res["summary_path"], encoding="utf-8-sig").read()
 
 
 def test_verify_swapped_folders_both_move(tmp_path, monkeypatch):
@@ -705,7 +717,8 @@ def test_verify_set_folder_photo_moves_to_right_set(tmp_path, monkeypatch):
     _photo(str(root / "Switch" / "By_Number" / "1-2" / "2.png"), _BLUE)  # set 2's label in set 1's folder
     res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=_sticker_doc,
                                by_color={_RED: ["S/N: SWQ00000001"], _BLUE: ["S/N: SWQ00000002"]})
-    assert _count_pictures(d.tables[0]) == 0 and _count_pictures(d.tables[1]) == 2
+    # only one label photo: it moves to set 2, the unreadable photo may be set 1's own and stays
+    assert _count_pictures(d.tables[0]) == 1 and _count_pictures(d.tables[1]) == 1
 
 
 def test_verify_mixed_folder_unread_follow_label_by_time(tmp_path, monkeypatch):

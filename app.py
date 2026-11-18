@@ -1418,6 +1418,65 @@ def _confirm_label_read(img_path: str, engine, key: str, rivals: set, doc_serial
     return ok, f"{agree}/{len(seen)} zoomed re-reads exact"
 
 
+def _verify_ocr_reads(paths: list[str], engine, doc_serials: dict[str, str], sticker_lookup, log,
+                      cancel_event=None) -> dict:
+    """
+    read_serial_from_photo() for every photo -> {path: (key or None, how)}.
+    With the real OpenThai engine the photos are read in parallel, one engine per worker thread
+    (the shared engine runs one inference at a time); other engines (tests, EasyOCR) read serially.
+    Stops early when cancel_event is set (missing paths = not read).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        from ocr_engine import OpenThaiEngine
+        parallel = isinstance(engine, OpenThaiEngine)
+    except Exception:
+        parallel = False
+    workers = max(1, min(4, (os.cpu_count() or 2) // 2)) if parallel else 1
+    total = len(paths)
+    results: dict = {}
+
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    def one(path):
+        eng = _worker_ocr_engine() if parallel else engine
+        return read_serial_from_photo(path, eng, doc_serials, sticker_lookup=sticker_lookup)
+
+    def record(path, outcome):
+        results[path] = outcome
+        if len(results) % 50 == 0 or len(results) == total:
+            log(f"    Verify OCR {len(results)}/{total} photo(s)...")
+
+    if workers == 1:
+        for path in paths:
+            if cancelled():
+                break
+            try:
+                record(path, one(path))
+            except Exception as e:
+                log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
+                record(path, (None, ""))
+        return results
+
+    log(f"    Verify OCR with {workers} worker(s)")
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="verify")
+    try:
+        futures = {pool.submit(one, p): p for p in paths}
+        for fut in as_completed(futures):
+            if cancelled():
+                break
+            path = futures[fut]
+            try:
+                record(path, fut.result())
+            except Exception as e:
+                log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
+                record(path, (None, ""))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return results
+
+
 def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engine=None,
                          sticker_lookup: dict[int, list[dict]] | None = None, time_fn=None,
                          log_cb=None, cancel_event=None, max_fuzzy: float = VERIFY_MAX_FUZZY) -> list[dict]:
@@ -1442,28 +1501,16 @@ def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engin
         from ocr_engine import get_engine
         engine = get_engine(log_cb=log_cb)
     time_fn = time_fn or photo_capture_time
-    total = sum(len(f["imgs"]) for f in folders)
-    done = 0
+    cache = _verify_ocr_reads([p for f in folders for p in f["imgs"]], engine, doc_serials,
+                              sticker_lookup, log, cancel_event)
     proposals: list[dict] = []
     for f_idx, f in enumerate(folders):
         if cancel_event is not None and cancel_event.is_set():
             break
         own = f["expected"]
-        reads = []          # (path, key or None, how)
-        for path in f["imgs"]:
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            try:
-                key, how = read_serial_from_photo(path, engine, doc_serials, sticker_lookup=sticker_lookup)
-            except Exception as e:
-                key, how = None, ""
-                log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
-            reads.append((path, key, how))
-            done += 1
-            if done % 50 == 0 or done == total:
-                log(f"    Verify OCR {done}/{total} photo(s)...")
-        if len(reads) < len(f["imgs"]):
-            break
+        if any(p not in cache for p in f["imgs"]):
+            break           # cancelled before all photos were read
+        reads = [(p, *cache[p]) for p in f["imgs"]]   # (path, key or None, how)
 
         strong = {p: k for p, k, h in reads if k and _strong_label_read(h, max_fuzzy)}
         hows = {p: h for p, _k, h in reads}
