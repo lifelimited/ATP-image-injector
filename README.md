@@ -40,7 +40,6 @@ Since v1.4.0 the Smart Rotate / MAC scanner OCR runs on **[OpenThai2.0-OCR-Text]
 
 For a massive EXE file download https://drive.google.com/file/d/1DP1b5245Kz_tljlczBh7rCKrCpvGjelG/view?usp=sharing
 
-
 ### Option 2: Run the .exe (Legacy / EXIF-only)
 
 1. Download `Unit_Test_Image_Injector_v1.2.1.exe` from the [Releases](../../releases) page
@@ -126,6 +125,16 @@ Click **▶ Run Injection** and watch the progress:
 ### Step 5: Stop (Optional)
 
 Click **■ Stop** at any time to cancel. Any images already inserted will be saved to the output file.
+
+### Command-line (batch) mode
+
+The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
+
+```bash
+Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
+```
+
+Options: `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
 
 ## Auto Mode (v1.6.0)
 
@@ -216,16 +225,6 @@ python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_I
 ```
 
 The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.1.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
-
-### Command-line (batch) mode
-
-The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
-
-```bash
-Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
-```
-
-Options: `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
 
 ## Requirements
 
