@@ -252,6 +252,17 @@ All OCR goes through [`ocr_engine.py`](ocr_engine.py) (`get_engine()`, `detect_o
 - Windows 10/11
 - No additional dependencies
 
+## Bug Reports Resolved (v1.6.1 – v1.6.2)
+
+If you saw any of these in v1.6.0 or v1.6.1, update to the latest release:
+
+| Symptom | Cause | Fixed in |
+|---|---|---|
+| **Photos of one model missing** while another model's folders worked (summary: *photo folder is empty* / *no photos found*; log: `[WARN] 53 duplicate folder name(s), using first`) | Folders named only by a number, `Model/By_Number/12/`, were read as a serial folder named `12`. The same numbers of different models collided and only the first model's photos were kept. | **v1.6.2**: such folders are ชุดที่ (set-number) folders, set 12 of the model. Real data: 285 → 338 of 453 tables, S5755 1 → 30/30. |
+| **Run takes hours** at *OCR 160/1827 photo(s)...* with a photo folder of a whole project | Every folder whose name was not a serial **of this document** was OCR'd, including the S/N folders of all the other devices and models. | **v1.6.1**: model folders not in the document (or unticked in Device Models) and folders named by another serial are skipped. 1,827 photos queued (~2 h) → 21 s. |
+| **Device photos inserted under the wrong device** (Read S/N from photos, one folder per device) | A photo whose label could not be read was given to whichever device was shot at a similar time, often a device in another folder. | **v1.6.1**: it goes to the S/N read in its own folder; a folder with no readable label is reported as unassigned instead. Real data: 35 → 0 wrong. |
+| **"Not Responding" right after picking the Word file** (no popup) | The document was opened up to 5 times on the window's thread; a large document with photos takes ~8 s per open. | **v1.6.1**: read once in the background with a *Loading...* popup; Configure Layout opens instantly. |
+
 ## Bug Reports Resolved (v1.3.1)
 
 If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now been officially resolved:
