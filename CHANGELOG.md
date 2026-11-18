@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+### Added
+- **Verify photos (OCR every folder)**: new `verify_photos` option in `run_injection()`, a **Verify photos (OCR every folder, slower)** checkbox under Auto-match (off by default) and `--verify` in `--cli`. Photos in S/N folders and set-number folders are OCR'd too, so a photo of device B left in device A's folder goes into B's table (`verify_folder_photos()`, `resolve_photo_moves()`). A wrong move is worse than no move, so it is strict:
+  - only an exact or near-exact S/N label read (fuzzy distance ≤ 1.0, `VERIFY_MAX_FUZZY`) moves a photo; a set-number sticker may confirm the folder's own device but never moves a photo;
+  - a read is not trusted for a move when another document serial differs from it only by OCR look-alikes (`P6H` read as `PGH`, both real serials), or when a fuzzy read is close to the folder's own serial (own label `NJ6` read as `NI6` → `NTG`) (`_move_read_doubt()`);
+  - such a look-alike read is trusted again only with stronger evidence: the label line is re-read zoomed in 6 variants (40/56/72 px × plain / contrast+sharpen) and must read exactly the same ≥ 5 times with no variant showing the look-alike (`_confirm_label_read()`), **and** at least 2 photos of the folder must pass this while no photo reads the look-alike or the folder's own serial;
+  - swapped folders are solved as a pair (`_swap_pair_proposals()`): folder B also moves when A moves whole to B on trusted reads and every label in B names A (no read of B), or when each folder has one label photo confirmed by the zoomed re-read naming the other; never when the two serials are close;
+  - all readable labels in a folder name device B (none name A) and there are **at least 2 such label photos** → the whole folder goes to B, unread photos included. With a **single** label photo of B only that photo moves: the unread photos may be A's own (e.g. a stray label photo next to an unreadable wide shot) and stay, unless B's folder in turn moves whole to A (a swap). Logged as `[VERF] … only 1 label photo …`;
+  - a mixed folder is split by label, unread photos follow a label shot ≤ 90 s apart, and the log warns;
+  - photos never go into a table that keeps its own photos (its S/N folder, set folder or OCR group), and photos of one device found in several folders are not moved; both cases are logged as `[WARN] … NOT moved` (two swapped folders do move);
+  - only the Word output changes, files on disk are never moved or renamed;
+  - the summary report has a new **Photos moved (wrong folder)** section (photo, from folder, to table with ชุดที่ and S/N, reason), and a table whose folder held only another device's photos says so under *Missing*.
+- Validation on hard-link copies of 40 S/N folders (~120 photos) of a delivered document, with 33 photos deliberately misplaced (4 devices' photos dropped into another device's folder, 3 pairs of folder names swapped, 3 single photos moved), three random samples: **0 wrong moves**; 18, 6 and 16 of 33 moved correctly, the rest left in place with a `[WARN]`/`[VERF]` line. The first version (no look-alike guard) made 2 wrong moves; with the guard alone only 6 moved per sample. Runtime 36 s → 134–167 s (≈ +1 s per photo, Smart Rotate off).
+  - Verify OCR runs in parallel (up to 4 workers, one OpenThai engine each, `_verify_ocr_reads()`): on correctly sorted real folders 48 photos 75 s → 47 s and 60 photos 109 s → 77 s, both with **0 moves**.
+- 16 tests in `test/test_auto_match.py` (fake OCR, made-up serials).
+
 ## [1.6.0] - 2026-11-17
 ### Added
 - **Auto Mode (Auto-match S/N)**: New `auto_match` option in `run_injection()` and an **Auto-match S/N (scan whole table)** checkbox (on by default). Every cell of each table is scanned for a serial matching a photo folder name, so no keyword or S/N/Image cell setup is needed and documents with different table layouts work as-is.

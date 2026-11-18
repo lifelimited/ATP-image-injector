@@ -119,6 +119,7 @@ Click **❓ วิธีใช้** (top right) for the built-in Thai usage guid
 | **📷 Shrink photos to 2000px** | **On by default.** ~5× smaller and much faster `.docx`, still ~360 dpi at 14 cm. Untick to embed original photos. |
 | **🔎 Auto-match S/N in tables** | **On by default.** Finds the S/N in any cell of each table and detects the photo cell (see [Auto Mode](#auto-mode-v160)). |
 | **🔎 Read S/N from photos (OCR)** | **On by default.** Photos in a folder that isn't named by a serial are OCR'd: the S/N label (zooming into small labels) or the box's set-number sticker (`31/100`). |
+| **🔎 Verify photos (OCR every folder)** | **Off by default** (slower: every photo is OCR'd). Catches photos put in the wrong S/N / set folder and inserts them into the right table (see [Verify photos](#verify-photos)). Files on disk are not moved. |
 | **🔎 Fallback: ชุดที่ folders (12-280)** | **On by default.** Tables still without photos are filled from set-number folders using the document's `ชุดที่ : N/T` (see [ชุดที่ fallback](#ชุดที่-set-number-fallback)). |
 
 ### Step 4: Run
@@ -203,6 +204,13 @@ For photo folders named by set number instead of S/N, e.g. `AirEngine8776-X7-T/B
 
 S/N always wins. A table already matched by an S/N folder or by OCR never takes set-folder photos, and the log says `N already matched by S/N`. Use this only when no S/N is available: if whoever named the folders counted differently from the document, photos land on the wrong device.
 
+### Verify photos
+Auto mode trusts folder names, so a photo of device B left in device A's folder normally goes into A's table. With **Verify photos** on, every photo of the S/N and set-number folders is OCR'd as well:
+- A photo is moved only on an **exact or near-exact S/N label** read. A set-number sticker can confirm a folder but never moves a photo, and neither can a fuzzy read close to the folder's own S/N. A read that another serial of the document resembles (OCR look-alikes such as `6`/`G`) moves only after 6 zoomed re-reads agree and a second photo confirms it.
+- If all readable labels of a folder name device B, the **whole folder** (unread photos too) goes to B. A **mixed** folder is split by label: unread photos follow a label photo shot ≤ 90 s apart, and the log warns.
+- Photos are **never added to a table that has its own photos**. They stay where they are and the log says `[WARN] … NOT moved`. Two folders whose names were swapped are corrected as a pair (`[SWAP]` in the log).
+- Only the Word output changes. The summary report lists every moved photo under **Photos moved (wrong folder)**.
+
 ### Example log
 ```
 OCR: reading S/N labels in 200 photo(s) from 1 folder(s) not named by serial (all)
@@ -261,7 +269,7 @@ The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
 Unit_Test_Image_Injector_v1.6.0.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
 ```
 
-Options: `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
+Options: `--verify`, `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
 
 ## Requirements
 

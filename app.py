@@ -1316,6 +1316,453 @@ def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=N
 
 
 # ─────────────────────────────────────────────
+# Verify photos: OCR every S/N / set folder and catch photos of another device
+# ─────────────────────────────────────────────
+VERIFY_MAX_FUZZY = 1.0  # a label read may move a photo only when exact or this close (fuzzy distance)
+
+
+def _strong_label_read(how: str, max_fuzzy: float = VERIFY_MAX_FUZZY) -> bool:
+    """True for an S/N label read trusted enough to move a photo: 'exact' or 'fuzzyN.N' with N.N <= max_fuzzy.
+    Sticker reads ('sticker N/T') never count."""
+    if not how or how.startswith("sticker"):
+        return False
+    m = re.match(r"^(exact|fuzzy(\d+(?:\.\d+)?))", how)
+    if not m:
+        return False
+    return m.group(1) == "exact" or float(m.group(2)) <= max_fuzzy + 1e-9
+
+
+VERIFY_OWN_MISREAD = 1.5   # a read this close to the folder's own serial is taken as a misread of its own label
+VERIFY_LOOKALIKE = 1.0     # another document serial closer than this (look-alikes only) makes a read ambiguous
+
+
+def _move_read_doubt(key: str, own: str, doc_serials: dict[str, str], how: str = "fuzzy") -> str:
+    """Why a label read of another device must not move a photo, or '' if it may.
+    Real cases: the folder's own 'NJ6' read as 'NI6' -> fuzzy match 'NTG'; 'P6H' read exactly as 'PGH',
+    also a real serial. An exact read differing from the folder's serial by a real character is trusted."""
+    if own and not how.startswith("exact") and _levenshtein(key, own, max_dist=VERIFY_OWN_MISREAD) <= VERIFY_OWN_MISREAD:
+        return f"close to the folder's own S/N {doc_serials.get(own, own)}"
+    for s in doc_serials:
+        if s != key and abs(len(s) - len(key)) <= 1 and _levenshtein(key, s, max_dist=1.0) < VERIFY_LOOKALIKE:
+            return f"look-alike of {doc_serials[s]}"
+    return ""
+
+
+def _lookalike_rivals(key: str, doc_serials: dict[str, str]) -> set:
+    """Other document serials that differ from key only by OCR look-alikes (distance < VERIFY_LOOKALIKE)."""
+    return {s for s in doc_serials if s != key and abs(len(s) - len(key)) <= 1
+            and _levenshtein(key, s, max_dist=1.0) < VERIFY_LOOKALIKE}
+
+
+CONFIRM_HEIGHTS = (40.0, 56.0, 72.0)   # text heights (px) of the zoomed re-reads
+CONFIRM_MIN_AGREE = 5                  # of 6 variants (3 heights x plain / contrast+sharpen)
+
+
+def _label_tokens(lines: list[str]) -> set:
+    toks = set()
+    for text in lines:
+        m = _OCR_SN_PREFIX_REGEX.search(text)
+        if m:
+            toks.add(normalize_sn(m.group(1)))
+        toks.add(normalize_sn(text))
+        toks.update(normalize_sn(t) for t in _SN_SPLIT_REGEX.split(text))
+    return {t for t in toks if len(t) >= 6}
+
+
+def _confirm_label_read(img_path: str, engine, key: str, rivals: set, doc_serials: dict[str, str]) -> tuple[bool, str]:
+    """
+    Re-read a label whose serial has look-alike rivals in the document (e.g. 'PGH' vs 'P6H'):
+    the label line is cropped and read in 6 variants (text height 40/56/72 px x plain / autocontrast+sharpen).
+    Confirmed only when >= CONFIRM_MIN_AGREE variants read exactly key and no variant reads a rival,
+    another serial, or a token at a rival's position (a single '6' vetoes 'G').
+    Returns (confirmed, detail).
+    """
+    from PIL import Image as PILImage, ImageOps, ImageFilter
+    img = _load_photo_for_ocr(img_path)
+    res = engine.read(img)
+    lines = [ln for ln in getattr(res, "lines", []) if getattr(ln, "box", None)]
+    target = [ln for ln in lines if find_serial_in_ocr_lines([ln.text], doc_serials)[0] == key]
+    if not target:
+        target = sorted((ln for ln in lines if _serial_like_line(ln.text)),
+                        key=lambda ln: 0 if _OCR_SN_PREFIX_REGEX.search(ln.text) else 1)[:1]
+    if target:
+        ln = target[0]
+        xs = [pt[0] for pt in ln.box]
+        ys = [pt[1] for pt in ln.box]
+        h = max(ys) - min(ys)
+        if h <= 0:
+            return False, "label line has no height"
+        x0, y0 = int(max(0, min(xs) - 2 * h)), int(max(0, min(ys) - 1.5 * h))
+        x1, y1 = int(min(img.width, max(xs) + 2 * h)), int(min(img.height, max(ys) + 1.5 * h))
+        if x1 <= x0 or y1 <= y0:
+            return False, "label line outside the photo"
+        base = img.crop((x0, y0, x1, y1))
+    else:   # engines without line boxes: re-read the whole photo
+        base, h = img, None
+    agree, seen = 0, []
+    for target_px in CONFIRM_HEIGHTS:
+        scale = min(8.0, max(1.0, target_px / h)) if h else target_px / CONFIRM_HEIGHTS[0]
+        big = base.resize((max(1, int(base.width * scale)), max(1, int(base.height * scale))), PILImage.LANCZOS)
+        for variant in (big, ImageOps.autocontrast(big).filter(ImageFilter.SHARPEN)):
+            texts = engine.read(variant).texts(include_dropped=True)
+            k2, how2 = find_serial_in_ocr_lines(texts, doc_serials)
+            toks = _label_tokens(texts)
+            if toks & rivals or (k2 and k2 in rivals):
+                return False, f"a re-read shows {doc_serials[(toks & rivals or {k2}).pop()]}"
+            if k2 and k2 != key:
+                return False, f"a re-read shows {doc_serials[k2]}"
+            if k2 == key and how2 == "exact":
+                agree += 1
+            seen.append(how2 or "-")
+    ok = agree >= CONFIRM_MIN_AGREE
+    return ok, f"{agree}/{len(seen)} zoomed re-reads exact"
+
+
+def _verify_ocr_reads(paths: list[str], engine, doc_serials: dict[str, str], sticker_lookup, log,
+                      cancel_event=None) -> dict:
+    """
+    read_serial_from_photo() for every photo -> {path: (key or None, how)}.
+    With the real OpenThai engine the photos are read in parallel, one engine per worker thread
+    (the shared engine runs one inference at a time); other engines (tests, EasyOCR) read serially.
+    Stops early when cancel_event is set (missing paths = not read).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        from ocr_engine import OpenThaiEngine
+        parallel = isinstance(engine, OpenThaiEngine)
+    except Exception:
+        parallel = False
+    workers = max(1, min(4, (os.cpu_count() or 2) // 2)) if parallel else 1
+    total = len(paths)
+    results: dict = {}
+
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    def one(path):
+        eng = _worker_ocr_engine() if parallel else engine
+        return read_serial_from_photo(path, eng, doc_serials, sticker_lookup=sticker_lookup)
+
+    def record(path, outcome):
+        results[path] = outcome
+        if len(results) % 50 == 0 or len(results) == total:
+            log(f"    Verify OCR {len(results)}/{total} photo(s)...")
+
+    if workers == 1:
+        for path in paths:
+            if cancelled():
+                break
+            try:
+                record(path, one(path))
+            except Exception as e:
+                log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
+                record(path, (None, ""))
+        return results
+
+    log(f"    Verify OCR with {workers} worker(s)")
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="verify")
+    try:
+        futures = {pool.submit(one, p): p for p in paths}
+        for fut in as_completed(futures):
+            if cancelled():
+                break
+            path = futures[fut]
+            try:
+                record(path, fut.result())
+            except Exception as e:
+                log(f"      [OCR ] {os.path.basename(path)}: cannot read ({e})")
+                record(path, (None, ""))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return results
+
+
+def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engine=None,
+                         sticker_lookup: dict[int, list[dict]] | None = None, time_fn=None,
+                         log_cb=None, cancel_event=None, max_fuzzy: float = VERIFY_MAX_FUZZY) -> list[dict]:
+    """
+    OCR every photo of folders whose device is known (S/N folders, set-number folders) and propose
+    moving photos that show another device's S/N label.
+      folders: [{'name': shown name, 'expected': normalized serial of the folder, 'imgs': [paths]}]
+    Rules (a wrong move is worse than no move):
+      - only an exact / near-exact S/N label read (see _strong_label_read) can move a photo;
+        a set-number sticker may confirm the folder's own device but never moves a photo;
+      - every strong read names one other device B and none the folder's own -> the whole folder is B
+        (unread photos included);
+      - otherwise (mixed) photos with a strong read of B move, and unread photos follow the nearest label
+        through the time chain (<= UNREAD_MAX_GAP_S); without capture times only the label photos move.
+    Returns proposals [{'folder': index in folders, 'path', 'to': normalized serial, 'reason', 'whole': bool}].
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    if engine is None:
+        from ocr_engine import get_engine
+        engine = get_engine(log_cb=log_cb)
+    time_fn = time_fn or photo_capture_time
+    cache = _verify_ocr_reads([p for f in folders for p in f["imgs"]], engine, doc_serials,
+                              sticker_lookup, log, cancel_event)
+    proposals: list[dict] = []
+    for f_idx, f in enumerate(folders):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        own = f["expected"]
+        if any(p not in cache for p in f["imgs"]):
+            break           # cancelled before all photos were read
+        reads = [(p, *cache[p]) for p in f["imgs"]]   # (path, key or None, how)
+
+        strong = {p: k for p, k, h in reads if k and _strong_label_read(h, max_fuzzy)}
+        hows = {p: h for p, _k, h in reads}
+        pending: dict[str, list] = {}          # look-alike ambiguous reads: serial -> [paths]
+        for p, k in list(strong.items()):
+            why = _move_read_doubt(k, own, doc_serials, hows[p]) if k != own else ""
+            if why:
+                del strong[p]
+                if why.startswith("look-alike"):
+                    pending.setdefault(k, []).append(p)
+                log(f"      [VERF] {f['name']}/{os.path.basename(p)}: S/N read {doc_serials[k]} not trusted "
+                    f"for a move ({why})")
+        doubted = {p for paths in pending.values() for p in paths} | {
+            p for p, k, h in reads if k and k != own and _strong_label_read(h, max_fuzzy) and p not in strong}
+        # A weaker (fuzzy) label read of the same serial may be the second photo, if it passes the re-read too
+        for p, k, h in reads:
+            if k in pending and p not in pending[k] and h and not h.startswith("sticker"):
+                pending[k].append(p)
+        # A look-alike ambiguous serial is trusted again only with >= 2 photos that each pass the zoomed
+        # re-read, and no photo of the folder reading a look-alike rival or the folder's own serial.
+        # Exactly one such photo is kept for the swap check (see _swap_pair_proposals).
+        single_confirmed = None
+        for k, paths in pending.items():
+            rivals = _lookalike_rivals(k, doc_serials) | ({own} if own else set())
+            if any(rk in rivals for _p, rk, _h in reads if rk):
+                log(f"      [VERF] {f['name']}: {doc_serials[k]} not confirmed - another photo reads a look-alike "
+                    f"or the folder's own S/N")
+                continue
+            results = []
+            for p in paths:
+                try:
+                    results.append(_confirm_label_read(p, engine, k, rivals, doc_serials))
+                except Exception as e:
+                    results.append((False, f"re-read failed ({e})"))
+            good = [p for p, (ok, _d) in zip(paths, results) if ok]
+            details = "; ".join(d for _ok, d in results)
+            if len(good) >= 2:
+                for p in good:
+                    strong[p] = k
+                log(f"      [VERF] {f['name']}: {doc_serials[k]} confirmed by {len(good)} photo(s) ({details})")
+            else:
+                if len(good) == 1 and len(pending) == 1:
+                    single_confirmed = k
+                log(f"      [VERF] {f['name']}: {doc_serials[k]} not confirmed ({details})")
+        f["verify_info"] = {
+            "own_read": any(k == own for _p, k, _h in reads),
+            "label_keys": {k for _p, k, h in reads if k and h and not h.startswith("sticker")},
+            "trusted_label_keys": {k for _p, k, h in reads if k and _strong_label_read(h, max_fuzzy)},
+            "single_confirmed": single_confirmed,
+        }
+        foreign = {p: k for p, k in strong.items() if k != own}
+        for p, k, h in reads:
+            if k and k != own and h.startswith("sticker"):
+                log(f"      [VERF] {f['name']}/{os.path.basename(p)}: sticker {h.split()[1]} says "
+                    f"{doc_serials[k]} - sticker alone never moves a photo")
+            elif k and k != own and p not in strong and p not in doubted:
+                log(f"      [VERF] {f['name']}/{os.path.basename(p)}: weak S/N read {doc_serials[k]} ({h}) "
+                    f"- not trusted for a move")
+        if not foreign:
+            continue
+
+        others = set(foreign.values())
+        if len(others) == 1 and not any(k == own for _p, k, _h in reads):
+            target = next(iter(others))
+            n_lab = len(foreign)
+            # With a single label photo the unread photos may still be the folder's own device (e.g. a stray
+            # label photo next to an unreadable wide shot): they are marked 'weak' and only move when the
+            # target's folder in turn shows this folder's device (a swap, see resolve_photo_moves).
+            weak = n_lab < 2
+            for p, _k, _h in reads:
+                why = (f"S/N label read {doc_serials[target]}" if p in foreign
+                       else f"whole folder shows {doc_serials[target]} ({n_lab} label photo(s))")
+                proposals.append({"folder": f_idx, "path": p, "to": target, "reason": why, "whole": True,
+                                  "weak": weak and p not in foreign})
+            continue
+
+        # Mixed folder: labels decide; unread photos follow a label shot close by (time chain)
+        stamps = [time_fn(p) for p, _k, _h in reads]
+        if all(t is not None for t in stamps):
+            order = sorted(range(len(reads)), key=lambda i: (stamps[i], os.path.basename(reads[i][0])))
+            times = [stamps[i] for i in order]
+        else:
+            order, times = list(range(len(reads))), None
+        seq = []
+        for i in order:
+            p, k, h = reads[i]
+            if p in strong:
+                seq.append((p, strong[p]))
+            elif k == own:          # a weaker read (sticker / fuzzy) may confirm the folder's own device
+                seq.append((p, own))
+            else:
+                seq.append((p, None))
+        if times is not None:
+            groups, _ = assign_unread_photos(seq, times)
+        else:
+            groups = {}
+            for p, k in seq:
+                groups.setdefault(k, []).append(p)
+        names = ", ".join(doc_serials[k] for k in sorted(others))
+        log(f"    [WARN] folder {f['name']}: mixed photos - labels of {names} besides "
+            f"{doc_serials.get(own, own)}; split by S/N label"
+            + ("" if times else " (no capture times: only label photos move)"))
+        for target, paths in groups.items():
+            if target is None or target == own:
+                continue
+            for p in paths:
+                why = (f"S/N label read {doc_serials[target]}" if p in foreign
+                       else f"no label; shot <= {UNREAD_MAX_GAP_S:.0f} s from a {doc_serials[target]} label photo")
+                proposals.append({"folder": f_idx, "path": p, "to": target, "reason": why, "whole": False})
+    return proposals
+
+
+def _swap_pair_proposals(folders: list[dict], proposals: list[dict], holders: dict, doc_serials: dict,
+                         log) -> list[dict]:
+    """
+    Two folders whose names were swapped: folder A (serial a) moves whole to b on trusted reads, and folder B
+    (serial b) was not moved because its label read of a was not trusted alone. B also moves whole to a when:
+      - B has no read of b at all (label or sticker),
+      - every S/N label read in B names a, at least one of them exact or near-exact,
+      - a and b are not close (distance > VERIFY_OWN_MISREAD), so B's read cannot be a misread of its own label.
+    Returns the extra proposals for B (logged as [SWAP]).
+    """
+    extra = []
+    moving = {pr["folder"] for pr in proposals}
+    whole_to: dict[int, str] = {}
+    for pr in proposals:
+        if pr["whole"]:
+            whole_to[pr["folder"]] = pr["to"]
+    for a_idx, b in whole_to.items():
+        a = folders[a_idx].get("expected")
+        if not a:
+            continue
+        for b_idx in holders.get(b, []):
+            info = folders[b_idx].get("verify_info")
+            if b_idx in moving or not info or info["own_read"]:
+                continue
+            if info["label_keys"] != {a} or a not in info["trusted_label_keys"]:
+                continue
+            if _levenshtein(a, b, max_dist=VERIFY_OWN_MISREAD) <= VERIFY_OWN_MISREAD:
+                continue
+            fb = folders[b_idx]
+            log(f"    [SWAP] folders {folders[a_idx]['name']} and {fb['name']} hold each other's photos - "
+                f"both moved")
+            for p in fb["imgs"]:
+                extra.append({"folder": b_idx, "path": p, "to": a, "whole": True,
+                              "reason": f"swapped with folder {folders[a_idx]['name']} (labels read "
+                                        f"{doc_serials.get(a, a)})"})
+            moving.add(b_idx)
+
+    # Both halves blocked as look-alikes: each folder has exactly one label photo that passed the zoomed
+    # re-read, naming the other folder's serial (two independent confirmed photos, as in the 2-photo rule).
+    by_serial = {f.get("expected"): i for i, f in enumerate(folders) if f.get("verify_info")}
+    for a_idx, fa in enumerate(folders):
+        ia = fa.get("verify_info")
+        if a_idx in moving or not ia or ia["own_read"] or not ia.get("single_confirmed"):
+            continue
+        a, b = fa["expected"], ia["single_confirmed"]
+        b_idx = by_serial.get(b)
+        if b_idx is None or b_idx in moving or b_idx == a_idx:
+            continue
+        fb = folders[b_idx]
+        ib = fb["verify_info"]
+        if ib["own_read"] or ib.get("single_confirmed") != a:
+            continue
+        if not ia["label_keys"] <= {b} or not ib["label_keys"] <= {a}:
+            continue
+        if _levenshtein(a, b, max_dist=VERIFY_OWN_MISREAD) <= VERIFY_OWN_MISREAD:
+            continue
+        log(f"    [SWAP] folders {fa['name']} and {fb['name']} hold each other's photos "
+            f"(each confirmed by a zoomed re-read) - both moved")
+        for src_idx, f_src, to, other in ((a_idx, fa, b, fb), (b_idx, fb, a, fa)):
+            for p in f_src["imgs"]:
+                extra.append({"folder": src_idx, "path": p, "to": to, "whole": True,
+                              "reason": f"swapped with folder {other['name']} (label confirmed by zoomed re-reads)"})
+        moving.update({a_idx, b_idx})
+    return extra
+
+
+def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holders: set | None = None,
+                        doc_serials: dict[str, str] | None = None, log_cb=None) -> list[dict]:
+    """
+    Accept the proposals that do not put photos into a table that already has its own photos.
+    A target serial T is free only when every folder of T (its S/N folder, its set folder) ends up empty
+    after its own accepted moves, T is not in fixed_holders (photos not verified, e.g. OCR-grouped), and
+    all photos for T come from a single folder. Rejections are repeated until nothing changes (a rejected
+    move keeps its photos in place, which may block another move). Two swapped folders both move.
+    Returns the accepted proposals; rejected ones are logged as [WARN].
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    doc_serials = doc_serials or {}
+    fixed_holders = fixed_holders or set()
+    holders: dict[str, list[int]] = {}
+    for i, f in enumerate(folders):
+        if f.get("expected"):
+            holders.setdefault(f["expected"], []).append(i)
+    accepted = list(proposals) + _swap_pair_proposals(folders, proposals, holders, doc_serials, log)
+
+    # Unread photos of a folder with only one foreign label photo ('weak') move only in a swap:
+    # the target's own folder moves whole to this folder's device.
+    whole_to: dict[int, str] = {}
+    for pr in accepted:
+        if pr.get("whole"):
+            whole_to.setdefault(pr["folder"], pr["to"])
+    mutual = {fi for fi, to in whole_to.items()
+              if any(whole_to.get(h) == folders[fi].get("expected") for h in holders.get(to, []))}
+    kept, dropped = [], {}
+    for pr in accepted:
+        if pr.get("weak") and pr["folder"] not in mutual:
+            dropped.setdefault(pr["folder"], []).append(pr)
+            continue
+        kept.append(pr)
+    for fi, prs in dropped.items():
+        log(f"    [VERF] folder {folders[fi]['name']}: only 1 label photo shows {doc_serials.get(prs[0]['to'], prs[0]['to'])}"
+            f" - that photo is moved, {len(prs)} unread photo(s) stay in the folder")
+    accepted = kept
+    proposals = accepted[:]
+    rejected_why: dict[str, str] = {}
+    while True:
+        out_count: dict[int, int] = {}
+        for pr in accepted:
+            out_count[pr["folder"]] = out_count.get(pr["folder"], 0) + 1
+        sources: dict[str, set] = {}
+        for pr in accepted:
+            sources.setdefault(pr["to"], set()).add(pr["folder"])
+        bad = {}
+        for target, srcs in sources.items():
+            if target in fixed_holders:
+                bad[target] = "its table already has photos (OCR-grouped)"
+            elif len(srcs) > 1:
+                bad[target] = "photos of it found in several folders (" + ", ".join(
+                    folders[i]["name"] for i in sorted(srcs)) + ")"
+            else:
+                for h in holders.get(target, []):
+                    if len(folders[h]["imgs"]) > out_count.get(h, 0):
+                        bad[target] = f"its table already has its own photos (folder {folders[h]['name']})"
+                        break
+        if not bad:
+            break
+        rejected_why.update(bad)
+        accepted = [pr for pr in accepted if pr["to"] not in bad]
+    for target, why in rejected_why.items():
+        n = sum(1 for pr in proposals if pr["to"] == target)
+        srcs = sorted({folders[pr["folder"]]["name"] for pr in proposals if pr["to"] == target})
+        log(f"    [WARN] {n} photo(s) in {', '.join(srcs)} show S/N {doc_serials.get(target, target)} "
+            f"but were NOT moved: {why} - please check")
+    return accepted
+
+
+# ─────────────────────────────────────────────
 # Auto Mode fallback: set-number folders ('ชุดที่ 12/280' <-> folder '12-280')
 # ─────────────────────────────────────────────
 SET_LABEL_REGEX = re.compile(r"^\s*(?:ชุด\s*ที่|set\s*(?:no\.?)?|unit\s*(?:no\.?)?)\s*[:.]?\s*$", re.IGNORECASE)
@@ -1514,7 +1961,8 @@ def build_injection_summary(doc, *, docx_path: str, photos_root: str, output_pat
                             active_models: list | None = None, unused_folders: list | None = None,
                             unassigned_photos: list | None = None, warnings: list | None = None,
                             cancelled: bool = False, images_total: int = 0, errors_total: int = 0,
-                            empty_folders: list | None = None) -> str:
+                            empty_folders: list | None = None, moved_photos: list | None = None,
+                            moved_out: dict | None = None) -> str:
     """
     Plain-text report of a run, per device group of the document:
       units with photos, partial units (fewer photos than usual), units without photos + reason,
@@ -1617,6 +2065,8 @@ def build_injection_summary(doc, *, docx_path: str, photos_root: str, output_pat
                     f"  {'-' * 12}|{'-' * 23}|{'-' * 30}"]
             for d in missing:
                 reason = skip_reasons.get(d["t_idx"])
+                if not reason and moved_out and d["sn"]:
+                    reason = moved_out.get(normalize_sn(d["sn"]))
                 if not reason:
                     reason = ("photo folder is empty (0 files)" if d["sn"] and normalize_sn(d["sn"]) in empty_keys
                               else "no photos found (no S/N folder, photo or sticker)")
@@ -1645,12 +2095,136 @@ def build_injection_summary(doc, *, docx_path: str, photos_root: str, output_pat
         sec += 1
         out += ["", f"{sec}. Photos without a readable S/N - not inserted ({len(unassigned_photos)})", "-" * W]
         out += [f"  {p}" for p in unassigned_photos]
+    if moved_photos:
+        sec += 1
+        by_serial = {}
+        for d in devices:
+            if d["sn"]:
+                by_serial.setdefault(normalize_sn(d["sn"]), d)
+        out += ["", f"{sec}. Photos moved (wrong folder) ({len(moved_photos)})", "-" * W,
+                "  Word output only - the files on disk were not moved.",
+                f"  {'Photo':<34}| {'From folder':<24}| {'To table (ชุดที่ / S/N)':<34}| Reason",
+                f"  {'-' * 34}|{'-' * 25}|{'-' * 35}|{'-' * 30}"]
+        for mv in moved_photos:
+            d = by_serial.get(normalize_sn(mv["to"]))
+            if d:
+                e = d["entry"]
+                to = (f"{e['n']}/{e['total']}, " if e else "") + f"table {d['t_idx']}: {d['sn']}"
+                if d["t_idx"] not in injected_tables:
+                    to += " [not inserted]"
+            else:
+                to = mv["to"]
+            out.append(f"  {mv['photo']:<34}| {mv['from']:<24}| {to:<34}| {mv['reason']}")
     if warnings:
         sec += 1
         out += ["", f"{sec}. Warnings and errors ({len(warnings)})", "-" * W]
         out += [f"  {w.strip()}" for w in warnings]
     out.append("")
     return "\n".join(out)
+
+
+def _verify_and_move_photos(doc, sn_root: str, sn_folders: dict, sn_to_model: dict, set_folders: list,
+                            ocr_grouped: set, report_moved: list, moved_out: dict, log, cancel_event=None,
+                            engine=None, time_fn=None) -> int:
+    """
+    Verify step of Auto mode: OCR the photos of S/N folders and set-number folders, then move the photos
+    of another device into that device's entry (sn_folders / set_folders are changed in place; files on
+    disk are untouched). Fills report_moved [{photo, from, to, reason}] and moved_out {serial: reason}.
+    Returns the number of photos moved.
+    """
+    doc_serials = extract_doc_serials(doc)
+    if not doc_serials:
+        log("\nVerify photos: no serial numbers in the document - skipped")
+        return 0
+    entries = extract_set_entries(doc)
+    sticker_lookup = build_set_sticker_lookup(entries)
+    set_expected: dict[int, str] = {}
+    if set_folders:
+        set_map = map_set_folders_to_tables(set_folders, entries, extract_doc_part_descriptions(doc))
+        for m in set_map.values():
+            key = normalize_sn(m["entry"].get("sn"))
+            if key in doc_serials:
+                set_expected[id(m["imgs"])] = key
+
+    def folder_name(imgs, fallback):
+        try:
+            return os.path.relpath(os.path.dirname(imgs[0]), sn_root)
+        except (ValueError, IndexError):
+            return fallback
+
+    folders = []
+    sn_keys = {normalize_sn(n) for n in sn_folders}
+    for name in sorted(sn_folders):
+        key = normalize_sn(name)
+        if key in doc_serials and key not in ocr_grouped and sn_folders[name]:
+            folders.append({"name": folder_name(sn_folders[name], name), "expected": key,
+                            "imgs": list(sn_folders[name]), "kind": "sn", "ref": name, "verify": True})
+    for f in set_folders:
+        key = set_expected.get(id(f["imgs"]))
+        if key:
+            folders.append({"name": folder_name(f["imgs"], f["name"]), "expected": key, "imgs": list(f["imgs"]),
+                            "kind": "set", "ref": f, "verify": key not in sn_keys})
+    check_idx = [i for i, f in enumerate(folders) if f["verify"]]
+    n_photos = sum(len(folders[i]["imgs"]) for i in check_idx)
+    log(f"\nVerify photos: OCR of {n_photos} photo(s) in {len(check_idx)} S/N / set folder(s) "
+        f"to catch photos in the wrong folder")
+    if not check_idx:
+        return 0
+    try:
+        props = verify_folder_photos([folders[i] for i in check_idx], doc_serials, engine=engine,
+                                     sticker_lookup=sticker_lookup, time_fn=time_fn, log_cb=log,
+                                     cancel_event=cancel_event)
+    except Exception as e:
+        log(f"  [ERR ] Verify photos: OCR unavailable: {e}")
+        return 0
+    if cancel_event is not None and cancel_event.is_set():
+        return 0
+    for pr in props:
+        pr["folder"] = check_idx[pr["folder"]]
+    accepted = resolve_photo_moves(folders, props, fixed_holders=set(ocr_grouped),
+                                   doc_serials=doc_serials, log_cb=log)
+    if not accepted:
+        log("  Verify photos: no photo needs moving")
+        return 0
+
+    # Apply: first take photos out of their folders, then give them to their device
+    by_src: dict[int, set] = {}
+    by_target: dict[str, list] = {}
+    for pr in accepted:
+        by_src.setdefault(pr["folder"], set()).add(pr["path"])
+        by_target.setdefault(pr["to"], []).append(pr)
+    for i, moved in by_src.items():
+        f = folders[i]
+        keep = [p for p in f["imgs"] if p not in moved]
+        if f["kind"] == "sn":
+            if keep:
+                sn_folders[f["ref"]] = keep
+            else:
+                sn_folders.pop(f["ref"], None)
+        else:
+            f["ref"]["imgs"][:] = keep
+        if not keep:
+            moved_out[f["expected"]] = f"all photos in folder {f['name']} showed another S/N (moved)"
+    set_folders[:] = [f for f in set_folders if f["imgs"]]
+    for target, prs in by_target.items():
+        src = folders[prs[0]["folder"]]
+        for name in [n for n in sn_folders if normalize_sn(n) == target]:
+            sn_folders.pop(name)        # emptied by its own moves (resolve_photo_moves checked)
+        new_name = doc_serials[target]
+        sn_folders[new_name] = [pr["path"] for pr in prs]
+        model = sn_to_model.get(src["ref"]) if src["kind"] == "sn" else src["ref"].get("model")
+        if model and not sn_to_model.get(new_name):
+            sn_to_model[new_name] = model
+        moved_out.pop(target, None)
+        emptied = all(p in by_src.get(prs[0]["folder"], set()) for p in src["imgs"])
+        log(f"  [MOVE] {len(prs)} photo(s) from folder {src['name']} -> S/N {new_name}"
+            + (" (whole folder)" if emptied else ""))
+        for pr in prs:
+            report_moved.append({"photo": os.path.relpath(pr["path"], sn_root), "from": src["name"],
+                                 "to": new_name, "reason": pr["reason"]})
+            log(f"      {os.path.basename(pr['path'])}: {pr['reason']}")
+    log(f"  Verify photos: {len(accepted)} photo(s) moved to the right device (Word output only)")
+    return len(accepted)
 
 
 def run_injection(docx_path: str, sn_root: str, output_path: str,
@@ -1661,6 +2235,7 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
                   auto_match: bool = False,
                   photo_ocr: bool = False,
                   set_number_fallback: bool = False,
+                  verify_photos: bool = False,
                   max_image_px: int = INSERT_MAX_PX,
                   workers: int | None = None,
                   write_summary: bool = True,
@@ -1678,6 +2253,9 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
       on their label; unreadable photos go to the serial shot closest in time.
     - set_number_fallback: (auto mode) tables still without photos are matched by 'ชุดที่ N/T' to
       folders named 'N-T' (model folder <-> device group by name and total). S/N always wins.
+    - verify_photos: (auto mode) OCR every photo of S/N and set-number folders too; a photo whose S/N
+      label clearly names another device is put into that device's table (Word output only, files on
+      disk are never moved). Never fills a table that already has its own photos. See verify_folder_photos.
     - max_image_px: shrink photos to this long side before inserting (0 = embed originals).
     - workers: photos prepared in parallel (rotation/OCR/resize); None = automatic.
     - write_summary: write '<output>_summary.txt' (per device: photos / partial / missing + reasons).
@@ -1695,6 +2273,9 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     injected_tables: dict[int, tuple] = {}
     report_unused: list[str] = []
     report_unassigned: list[str] = []
+    report_moved: list[dict] = []
+    moved_out: dict[str, str] = {}
+    ocr_grouped: set[str] = set()
 
     def log(msg):
         if "[WARN]" in msg or "[ERR" in msg or "ERROR" in msg:
@@ -1755,6 +2336,7 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
                 sn_folders[serial] = imgs
                 if src_model:
                     sn_to_model[serial] = src_model
+            ocr_grouped = {normalize_sn(k) for k in used}
             counts = [len(v) for v in used.values()]
             if counts:
                 typical = max(set(counts), key=counts.count)
@@ -1776,6 +2358,15 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     if set_folders:
         log(f"  Found {len(set_folders)} set-number folder(s) (e.g. '{set_folders[0]['name']}') "
             f"for the ชุดที่ fallback")
+
+    if auto_match and verify_photos and (sn_folders or set_folders):
+        if doc is None:
+            doc = Document(docx_path)
+        _verify_and_move_photos(doc, sn_root, sn_folders, sn_to_model, set_folders, ocr_grouped,
+                                report_moved, moved_out, log, cancel_event)
+        if is_cancelled():
+            log("\n[CANCELLED] Stopped by user.")
+            return InjectionResult(0, 0, 0, ["Cancelled"])
 
     if not sn_folders and not set_folders:
         log(f"ERROR: No matching folders found in the selected directory.")
@@ -2085,6 +2676,7 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
                 saved=injected > 0, injected_tables=injected_tables, skip_reasons=skip_reasons,
                 start_table=start_table, active_models=active_models, unused_folders=report_unused,
                 unassigned_photos=report_unassigned, warnings=report_warnings, cancelled=cancelled,
+                moved_photos=report_moved, moved_out=moved_out,
                 images_total=img_count, errors_total=len(errors),
                 empty_folders=find_empty_folders(sn_root))
             summary_file = summary_path_for(output_path)
@@ -2546,6 +3138,7 @@ class App(tk.Tk):
         self.auto_match_var = tk.BooleanVar(value=True)
         self.photo_ocr_var = tk.BooleanVar(value=True)
         self.set_fallback_var = tk.BooleanVar(value=True)
+        self.verify_photos_var = tk.BooleanVar(value=False)  # slow: OCR of every photo
 
         # ── Milestone 2 State Variables ──
         self.start_table_var = tk.StringVar(value="1")
@@ -2753,6 +3346,8 @@ class App(tk.Tk):
             self.photo_ocr_var, sub=True)
         self.set_fallback_cb = self._option_check(
             right, "Fallback: ชุดที่ folders (12-280)", self.set_fallback_var, sub=True)
+        self.verify_photos_cb = self._option_check(
+            right, "Verify photos (OCR every folder, slower)", self.verify_photos_var, sub=True)
 
     def _make_file_card(self, parent, label_text, var, command, icon="📄", with_config=False):
         C = self.COLORS
@@ -3382,7 +3977,7 @@ class App(tk.Tk):
         entry = getattr(self, "kw_entry", None)
         if entry is not None:
             entry.configure(state="disabled" if auto else "normal")
-        for name in ("photo_ocr_cb", "set_fallback_cb"):
+        for name in ("photo_ocr_cb", "set_fallback_cb", "verify_photos_cb"):
             cb = getattr(self, name, None)
             if cb is not None:
                 cb.configure(state="normal" if auto else "disabled")
@@ -3461,6 +4056,7 @@ class App(tk.Tk):
                     auto_match=auto_match,
                     photo_ocr=self.photo_ocr_var.get(),
                     set_number_fallback=self.set_fallback_var.get(),
+                    verify_photos=self.verify_photos_var.get(),
                     log_callback=self._log,
                     progress_callback=self._update_progress,
                     cancel_event=self._cancel_event
@@ -3509,7 +4105,7 @@ def cli_main(argv: list[str]) -> int:
     """
     Headless run (Auto mode), e.g. for batch jobs or testing the built .exe:
       app.exe --cli --docx DOC.docx --photos PHOTO_ROOT --out OUT.docx [--log run.log]
-              [--no-ocr] [--no-set-fallback] [--no-smart-rotate] [--start-table N]
+              [--no-ocr] [--no-set-fallback] [--no-smart-rotate] [--start-table N] [--verify]
     The windowed .exe has no console, so use --log to see progress. Exit code 0 = images injected.
     """
     import argparse
@@ -3523,6 +4119,8 @@ def cli_main(argv: list[str]) -> int:
     p.add_argument("--no-ocr", action="store_true")
     p.add_argument("--no-set-fallback", action="store_true")
     p.add_argument("--no-smart-rotate", action="store_true")
+    p.add_argument("--verify", action="store_true",
+                   help="OCR every S/N / set folder and move photos of another device (slower)")
     p.add_argument("--original-size", action="store_true", help="embed photos without shrinking")
     p.add_argument("--workers", type=int, default=None)
     args = p.parse_args(argv)
@@ -3550,6 +4148,7 @@ def cli_main(argv: list[str]) -> int:
             pass
         res = run_injection(args.docx, args.photos, args.out, auto_match=True,
                             photo_ocr=not args.no_ocr, set_number_fallback=not args.no_set_fallback,
+                            verify_photos=args.verify,
                             start_table=args.start_table, auto_rotate=True,
                             smart_rotate=not args.no_smart_rotate,
                             max_image_px=0 if args.original_size else INSERT_MAX_PX,
