@@ -35,6 +35,7 @@ import glob
 import tempfile
 import atexit
 import threading
+import eta
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -1350,6 +1351,7 @@ def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=N
     progress = {"done": 0, "logged": 0}
 
     def collect(rows):
+        eta.advance("ocr", len(rows))
         for path, key, how, err in rows:
             results[path] = (key, how)
             if err is not None:
@@ -1611,6 +1613,7 @@ def _verify_ocr_reads(paths: list[str], engine, doc_serials: dict[str, str], sti
 
     def record(path, outcome):
         results[path] = outcome
+        eta.advance("verify", 1)
         if len(results) % 50 == 0 or len(results) == total:
             log(f"    Verify OCR {len(results)}/{total} photo(s)...")
 
@@ -2336,6 +2339,7 @@ def _verify_and_move_photos(doc, sn_root: str, sn_folders: dict, sn_to_model: di
         f"to catch photos in the wrong folder")
     if not check_idx:
         return 0
+    eta.start("verify", n_photos)
     try:
         props = verify_folder_photos([folders[i] for i in check_idx], doc_serials, engine=engine,
                                      sticker_lookup=sticker_lookup, time_fn=time_fn, log_cb=log,
@@ -2343,6 +2347,8 @@ def _verify_and_move_photos(doc, sn_root: str, sn_folders: dict, sn_to_model: di
     except Exception as e:
         log(f"  [ERR ] Verify photos: OCR unavailable: {e}")
         return 0
+    finally:
+        eta.finish("verify")
     if cancel_event is not None and cancel_event.is_set():
         return 0
     for pr in props:
@@ -2393,7 +2399,31 @@ def _verify_and_move_photos(doc, sn_root: str, sn_folders: dict, sn_to_model: di
     return len(accepted)
 
 
-def run_injection(docx_path: str, sn_root: str, output_path: str,
+def run_injection(*args, eta_callback=None, eta_stats_path=None, **kwargs) -> "InjectionResult":
+    """
+    Run the injection (see _run_injection) while estimating the time left:
+    eta_callback(status_text, fraction_done) is called about once a second from the worker thread.
+    eta_stats_path: JSON file where the measured speeds of this computer are kept between runs.
+    """
+    import inspect
+    bound = inspect.signature(_run_injection).bind_partial(*args, **kwargs)
+    bound.apply_defaults()
+    a = bound.arguments
+    variant = {"insert": "smart" if a.get("smart_rotate") else ("plain" if a.get("max_image_px") else "orig")}
+    tracker = eta.EtaTracker(callback=eta_callback, stats_path=eta_stats_path, variant=variant)
+    eta.set_active(tracker)
+    try:
+        return _run_injection(*args, **kwargs)
+    finally:
+        eta.set_active(None)
+        tracker.close()
+        run_injection.last_tracker = tracker
+
+
+run_injection.last_tracker = None
+
+
+def _run_injection(docx_path: str, sn_root: str, output_path: str,
                   keyword: str = "WZP",
                   sn_row_col: tuple = (5, 3), img_row_col: tuple = (12, 0),
                   start_table: int = 1,
@@ -2493,6 +2523,12 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             if sticker_lookup:
                 log("  Set-number stickers understood (N/total): "
                     + ", ".join(f"/{t}" for t in sorted(sticker_lookup)))
+            named = sum(len(v) for k, v in sn_folders.items() if normalize_sn(k) in doc_serials)
+            eta.plan("insert", named + len(ocr_imgs))
+            eta.plan("save", named + len(ocr_imgs))
+            if verify_photos:
+                eta.plan("verify", named)
+            eta.start("ocr", len(ocr_imgs))
             try:
                 groups, unassigned = group_photos_by_ocr(ocr_imgs, doc_serials, log_cb=log,
                                                          cancel_event=cancel_event,
@@ -2500,6 +2536,8 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             except Exception as e:
                 groups, unassigned = {}, []
                 log(f"  [ERR ] OCR unavailable: {e}")
+            finally:
+                eta.finish("ocr")
             src_model = next((sn_to_model.get(n) for n in unnamed if sn_to_model.get(n)), None)
             for name in unnamed:
                 sn_folders.pop(name, None)
@@ -2537,6 +2575,18 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
         log(f"  Found {len(set_folders)} set-number folder(s) (e.g. '{set_folders[0]['name']}') "
             f"for the ชุดที่ fallback")
 
+    if auto_match and (sn_folders or set_folders):
+        try:
+            if doc is None:
+                doc = Document(docx_path)
+            _ser = extract_doc_serials(doc)
+            _named = sum(len(v) for k, v in sn_folders.items() if normalize_sn(k) in _ser)
+            _set_photos = sum(len(f["imgs"]) for f in set_folders)
+            _planned = _named + (_set_photos if _named == 0 else 0)
+            eta.plan("insert", _planned)
+            eta.plan("save", _planned)
+        except Exception:
+            pass
     if auto_match and verify_photos and (sn_folders or set_folders):
         if doc is None:
             doc = Document(docx_path)
@@ -2750,6 +2800,10 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
         for img_idx, path in enumerate(imgs or []):
             prep_futures[(t_idx, img_idx)] = pool.submit(prepare_photo, path, auto_rotate, smart_rotate,
                                                          max_image_px)
+    eta.start("insert", len(prep_futures))
+    for _fut in prep_futures.values():                 # photo preparation is the real work
+        _fut.add_done_callback(lambda _f: eta.advance("insert", 1))
+    eta.plan("save", len(prep_futures))
     log(f"  Preparing {len(prep_futures)} photo(s) with {workers} worker(s)"
         + (f", max {max_image_px}px" if max_image_px else ", original size"))
 
@@ -2828,6 +2882,7 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             log(f"  [OK  ] {sn} (table {t_idx:>3}): {cell_img_count} image(s)")
 
     pool.shutdown(wait=True, cancel_futures=True)
+    eta.finish("insert")
 
     # ── Step 5: Save ──
     cancelled = is_cancelled()
@@ -2841,7 +2896,10 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
             log(f"  Status           : PARTIAL (cancelled)")
         log(f"{'═' * 50}")
 
+        eta.start("save", img_count)
         doc.save(output_path)
+        eta.finish("save")
+        eta.start("summary", 1)
         log(f"\nSaved -> {output_path}")
     else:
         log("\nNo images were injected. Output file not saved.")
@@ -2874,6 +2932,18 @@ def run_injection(docx_path: str, sn_root: str, output_path: str,
     result["summary_path"] = summary_file
     return result
 
+
+
+def _set_run_injection_signature():
+    import inspect
+    sig = inspect.signature(_run_injection)
+    extra = [inspect.Parameter("eta_callback", inspect.Parameter.KEYWORD_ONLY, default=None),
+             inspect.Parameter("eta_stats_path", inspect.Parameter.KEYWORD_ONLY, default=None)]
+    run_injection.__signature__ = sig.replace(parameters=list(sig.parameters.values()) + extra)
+    run_injection.__doc__ = (run_injection.__doc__ or "") + (_run_injection.__doc__ or "")
+
+
+_set_run_injection_signature()
 
 class TableSelectionDialog(tk.Toplevel):
     def __init__(self, parent, docx_path: str, current_sn_rc: tuple, current_img_rc: tuple, initial_table_idx: int = 0):
@@ -4067,6 +4137,8 @@ class App(tk.Tk):
         self.after(0, _append)
 
     def _update_progress(self, current, total):
+        if getattr(self, "_eta_active", False):
+            return                       # the time-left estimate drives the bar and status
         def _set():
             self.progress["maximum"] = total
             self.progress["value"] = current
@@ -4074,7 +4146,29 @@ class App(tk.Tk):
             self.status_label.configure(text=f"Processing... {current}/{total} ({pct}%)")
         self.after(0, _set)
 
+    def _update_eta(self, text: str, fraction: float):
+        """Called from the worker thread with e.g. 'Inserting photos... 80/129 · about 40 s left'."""
+        self._eta_active = True
+        def _set():
+            try:
+                self.progress["maximum"] = 1000
+                value = int(1000 * max(0.0, min(1.0, fraction)))
+                if self.progress["maximum"] == 1000 and getattr(self, "_eta_bar", 0) > value:
+                    value = self._eta_bar               # the bar never moves backwards
+                self._eta_bar = value
+                self.progress["value"] = value
+                self.status_label.configure(text=text, foreground=self.COLORS["accent_ok"])
+            except tk.TclError:
+                pass
+        try:
+            self.after(0, _set)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _set_running(self, running: bool):
+        if running:
+            self._eta_active = False
+            self._eta_bar = 0
         def _update():
             self._running = running
             C = self.COLORS
@@ -4351,6 +4445,8 @@ class App(tk.Tk):
                     verify_photos=self.verify_photos_var.get(),
                     log_callback=self._log,
                     progress_callback=self._update_progress,
+                    eta_callback=self._update_eta,
+                    eta_stats_path=eta.default_stats_path(),
                     cancel_event=self._cancel_event
                 )
                 injected, img_count, no_folder, errors = result

@@ -124,20 +124,30 @@ def ensure_model(model_dir: Path, log_cb: LogCb = None) -> Path:
     return model_dir
 
 
+_runtime_lock = threading.Lock()
+
+
 def _load_runtime(model_dir: Path):
     """Import the model's bundled ``runtime`` package under a unique name
     (the folder name 'OpenThai2.0-OCR-Text' is not importable, and a bare
-    ``runtime`` package name could clash with other modules)."""
+    ``runtime`` package name could clash with other modules).
+    Locked: worker threads creating their engines at the same time must not see a
+    half-imported package ("partially initialized module")."""
     pkg_name = "openthai_ocr_runtime"
-    if f"{pkg_name}.line_engine" in sys.modules:
-        return sys.modules[f"{pkg_name}.line_engine"]
-    rt_dir = model_dir / "runtime"
-    spec = importlib.util.spec_from_file_location(
-        pkg_name, rt_dir / "__init__.py", submodule_search_locations=[str(rt_dir)])
-    pkg = importlib.util.module_from_spec(spec)
-    sys.modules[pkg_name] = pkg
-    spec.loader.exec_module(pkg)
-    return importlib.import_module(f"{pkg_name}.line_engine")
+    with _runtime_lock:
+        if f"{pkg_name}.line_engine" in sys.modules:
+            return sys.modules[f"{pkg_name}.line_engine"]
+        rt_dir = model_dir / "runtime"
+        spec = importlib.util.spec_from_file_location(
+            pkg_name, rt_dir / "__init__.py", submodule_search_locations=[str(rt_dir)])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules[pkg_name] = pkg
+        try:
+            spec.loader.exec_module(pkg)
+            return importlib.import_module(f"{pkg_name}.line_engine")
+        except Exception:
+            sys.modules.pop(pkg_name, None)
+            raise
 
 
 # ─────────────────────────────────────────────
