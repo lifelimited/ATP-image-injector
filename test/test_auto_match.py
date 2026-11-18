@@ -546,6 +546,36 @@ def test_run_injection_set_fallback_and_sn_priority(tmp_path):
     assert res2.injected == 1
 
 
+
+def test_plain_number_folders_under_by_number_are_set_folders(tmp_path):
+    """Model/By_Number/<n>/ (no '-total'): set n; same numbers in two models do not collide,
+    are not OCR'd as unnamed folders, and fill the right tables. Empty By_SN folders are ignored."""
+    p = tmp_path / "d.docx"
+    _set_doc(str(p))
+    root = tmp_path / "photos"
+    for n in (1, 2, 3):
+        _make_photo(str(root / "AirEngine8776-X7-T" / "By_Number" / str(n)), f"ap{n}.jpg")
+        os.makedirs(root / "AirEngine8776-X7-T" / "By_SN" / f"AP000000000{n}", exist_ok=True)  # empty
+    _make_photo(str(root / "S6750-H48Y8C" / "by_Number" / "1"), "core.jpg")
+    _make_photo(str(root / "S6750-H48Y8C" / "by_Number" / "1"), "core2.jpg")
+
+    sets = app.find_set_number_folders(str(root))
+    got = sorted((f["model"], f["n"], f["total"]) for f in sets)
+    assert got == [("AirEngine8776-X7-T", 1, 3), ("AirEngine8776-X7-T", 2, 3), ("AirEngine8776-X7-T", 3, 3),
+                   ("S6750-H48Y8C", 1, 1)]
+    logs = []
+    leaf = app.find_sn_leaf_folders(str(root), log_cb=logs.append)
+    assert dict(leaf) == {} and not any("duplicate" in m for m in logs)
+
+    out = tmp_path / "o.docx"
+    res = app.run_injection(str(p), str(root), str(out), auto_match=True, photo_ocr=True,
+                            set_number_fallback=True, auto_rotate=False, smart_rotate=False,
+                            log_callback=logs.append)
+    assert res.injected == 4 and res.img_count == 5 and not res.errors
+    d = Document(str(out))
+    assert [_count_pictures(d.tables[i]) for i in (1, 2, 3, 4)] == [1, 1, 1, 2]
+    assert not any(m.startswith("OCR: reading") for m in logs)
+
 def test_assign_unread_far_from_any_label_stays_unassigned():
     """Mixed devices: other devices' photos (labels unreadable) shot minutes away are not pulled in."""
     seq = [("A", "A"), ("a1", None), ("s1", None), ("s2", None), ("B", "B"), ("x1", None), ("x2", None)]

@@ -624,12 +624,44 @@ STRICT_CAMERA_DIR_REGEX = re.compile(r"^(?:dcim|camera|\d{3}[a-z_][a-z0-9_]{1,4}
 _SN_VALUE_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/_.]{5,}$")
 
 
+_PLAIN_NUMBER_REGEX = re.compile(r"^\s*(\d{1,4})\s*$")
+
+
+def _plain_set_number(dirpath: str, parts: list[str], cache: dict | None = None):
+    """
+    (n, total) for a folder named only by a number inside a 'By_Number'-like container,
+    e.g. Model/By_Number/12/ = set 12. total = the number of numbered sibling folders or the
+    highest number among them, whichever is larger (empty siblings count: photos may be missing).
+    None for any other folder.
+    """
+    if len(parts) < 2 or not GENERIC_FOLDER_REGEX.match(parts[-2]):
+        return None
+    m = _PLAIN_NUMBER_REGEX.match(parts[-1])
+    if not m:
+        return None
+    n = int(m.group(1))
+    parent = os.path.dirname(dirpath)
+    total = cache.get(parent) if cache is not None else None
+    if total is None:
+        try:
+            nums = [int(d) for d in os.listdir(parent)
+                    if _PLAIN_NUMBER_REGEX.match(d) and os.path.isdir(os.path.join(parent, d))]
+        except OSError:
+            nums = [n]
+        total = max(len(nums), max(nums, default=n))
+        if cache is not None:
+            cache[parent] = total
+    return (n, total) if 1 <= n <= total else None
+
+
 def find_sn_leaf_folders(root: str, log_cb=None) -> "SnFolderMap":
     """
     Auto-mode folder scan at any depth: every folder that directly holds images is a
     candidate serial folder named after itself, e.g. root/Model/By_SN/<SN>/img.jpg.
     - Camera subfolders (DCIM, 100APPLE, ...) take the name of their parent folder.
-    - Sequence-number folders like '195-280' are ignored (not serials).
+    - Sequence-number folders like '195-280', and folders named only by a number inside a
+      'By_Number' container (Model/By_Number/12/), are ignored: they are ชุดที่ folders
+      (see find_set_number_folders), not serials.
     - If the same name appears twice, the first folder (sorted path order) wins.
     sn_to_model maps each serial to the top-level folder under root.
     """
@@ -639,6 +671,7 @@ def find_sn_leaf_folders(root: str, log_cb=None) -> "SnFolderMap":
         return SnFolderMap(sn_map, sn_to_model=sn_to_model)
     root_abs = os.path.abspath(root)
     duplicates = []
+    plain_cache: dict = {}
 
     for dirpath, dirnames, filenames in os.walk(root_abs):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(('.', '__')))
@@ -656,7 +689,7 @@ def find_sn_leaf_folders(root: str, log_cb=None) -> "SnFolderMap":
         if not parts:
             continue
         name = parts[-1]
-        if SEQ_FOLDER_REGEX.match(name):
+        if SEQ_FOLDER_REGEX.match(name) or _plain_set_number(dirpath, parts, plain_cache):
             continue
         if name in sn_map:
             if os.path.dirname(sn_map[name][0]) != dirpath:
@@ -1995,7 +2028,9 @@ def extract_set_entries(doc) -> list[dict]:
 
 def find_set_number_folders(root: str) -> list[dict]:
     """
-    Folders named like '12-280' (set 12 of 280) that hold images, at any depth.
+    Folders named like '12-280' (set 12 of 280) that hold images, at any depth, and folders
+    named only by a number inside a 'By_Number'-like container (Model/By_Number/12/ = set 12,
+    total from the numbered sibling folders).
     model = nearest parent folder that is not a generic container ('By_Number', 'SN', ...).
     Returns [{model, n, total, name, imgs}].
     """
@@ -2004,6 +2039,7 @@ def find_set_number_folders(root: str) -> list[dict]:
         return out
     root_abs = os.path.abspath(root)
     root_name = os.path.basename(root_abs)
+    plain_cache: dict = {}
     for dirpath, dirnames, filenames in os.walk(root_abs):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(('.', '__')))
         imgs = [os.path.join(dirpath, f) for f in sorted(filenames)
@@ -2017,9 +2053,13 @@ def find_set_number_folders(root: str) -> list[dict]:
         if not parts:
             continue
         m = re.match(r"^\s*(\d{1,4})\s*[-_/]\s*(\d{1,4})\s*$", parts[-1])
-        if not m:
-            continue
-        n, total = int(m.group(1)), int(m.group(2))
+        if m:
+            n, total = int(m.group(1)), int(m.group(2))
+        else:
+            plain = _plain_set_number(dirpath, parts, plain_cache)
+            if not plain:
+                continue
+            n, total = plain
         if not (1 <= n <= total):
             continue
         ancestors = [p for p in reversed(parts[:-1]) if not GENERIC_FOLDER_REGEX.match(p)]
