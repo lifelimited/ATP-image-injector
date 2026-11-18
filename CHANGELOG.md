@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [1.7.0-beta] - 2026-11-18 (pre-release)
 ### Added
 - **Verify photos (OCR every folder)**: new `verify_photos` option in `run_injection()`, a **Verify photos (OCR every folder, slower)** checkbox under Auto-match (off by default) and `--verify` in `--cli`. Photos in S/N folders and set-number folders are OCR'd too, so a photo of device B left in device A's folder goes into B's table (`verify_folder_photos()`, `resolve_photo_moves()`). A wrong move is worse than no move, so it is strict:
   - only an exact or near-exact S/N label read (fuzzy distance ≤ 1.0, `VERIFY_MAX_FUZZY`) moves a photo; a set-number sticker may confirm the folder's own device but never moves a photo;
