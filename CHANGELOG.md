@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+### Fixed
+- **Photos in `Model/By_Number/<n>/` folders were lost or OCR'd for nothing.** A folder named only by a number (no `-total`, e.g. `S5755-H24UM4Y2CZ/by_Number/12/`) was taken as a serial folder named `12`, so the same numbers of different models collided (`[WARN] 53 duplicate folder name(s), using first`) and one model's photos were dropped, and all such photos went through OCR. They are now ชุดที่ folders: set n, total = the number of numbered sibling folders or the highest number (`_plain_set_number()`), mapped by model name and total like `12-280` folders. Real data (OneDrive export, 5 model folders, `By_SN` folders empty): 285 → 338 of 453 tables with photos, S5755 1 → 30 of 30, OCR 781 → 221 photos.
+
 ## [1.6.1] - 2026-11-18
 ### Fixed
 - **The window no longer freezes while a document or photo folder is loaded.** Picking a .docx opened it up to 5 times on the UI thread (a 613-table document with photos takes ~8 s per open). It is now read once in the background with a small *Loading...* popup (file name and a moving bar, shown only when loading takes over 0.3 s), and the opened document is cached for the table count, device models and Configure Layout (`open_docx_readonly()`), which now opens instantly.
