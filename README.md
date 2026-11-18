@@ -165,6 +165,16 @@ It also lists S/N repeated in several document tables, photo folders not in the 
 
 Click **■ Stop** at any time to cancel. Any images already inserted will be saved to the output file.
 
+### Command-line (batch) mode
+
+The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
+
+```bash
+Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
+```
+
+Options: `--verify`, `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
+
 ## Auto Mode (v1.6.0)
 
 Auto mode lets you pick only the Word document and the photo folder. Everything else is found automatically.
@@ -261,16 +271,6 @@ python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_I
 ```
 
 The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.1.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
-
-### Command-line (batch) mode
-
-The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
-
-```bash
-Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
-```
-
-Options: `--verify`, `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
 
 ## Requirements
 
