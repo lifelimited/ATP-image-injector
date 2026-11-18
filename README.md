@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.6.0-orange)
+![Version](https://img.shields.io/badge/Version-1.6.1-orange)
 ![OCR](https://img.shields.io/badge/OCR-OpenThai2.0--OCR--Text-purple)
 
 ## Overview
@@ -212,17 +212,17 @@ The app natively parses the first table in your Word document and displays it in
 pip install pyinstaller
 
 # Build standalone executable (bundles the OpenThai OCR model + its runtime imports)
-python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.0" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.1" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
 ```
 
-The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.0.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
+The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.1.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
 
 ### Command-line (batch) mode
 
 The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
 
 ```bash
-Unit_Test_Image_Injector_v1.6.0.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
+Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
 ```
 
 Options: `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
@@ -262,7 +262,10 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
-### v1.6.0 (Current)
+### v1.6.1 (Current)
+- ⚡ **Read S/N from photos: no OCR of other devices' folders** — model folders (`7821/`, `8841/`) whose model is not in the document or is unticked in the Device Models filter, and folders named by a serial that is not in the document, are skipped. A photo root of a whole project used with a document of 43 devices: about 2 h → 21 s.
+
+### v1.6.0
 - 🔎 **Auto Mode** — Matches the S/N anywhere in each table and detects the photo cell automatically. Summary tables are skipped and `[FIND]` log lines show which cells were used.
 - 📂 **Nested Folder Scan** — Finds S/N folders at any depth (`Model/By_SN/<serial>/`), ignores `195-280` sequence folders, and includes photos in the selected folder itself.
 - 📷 **Read S/N from Photos (OCR)** — Groups unsorted photos per device by reading the S/N on the box label, tolerating small OCR errors. Unread photos go to the device shot closest in time (EXIF), so the label can be shot before or after the device photos.

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.1] - 2026-11-18
+### Fixed
+- **Read S/N from photos OCR'd photos of devices that are not in the document.** A photo root holding every device of a project (`7821/<serial>/`, `8841/<serial>/`), used with a document of only some of them, sent every other folder through OCR (~4–5 s per photo). Two checks now run before OCR:
+  - **Model folders**: the document's device models are read first, and folders under a model folder whose model is not in the document, or is unticked in the Device Models filter, are skipped (`_ocr_skip_model_folders()`). This only applies when at least one model folder matches a document model, so a document whose models cannot be read is OCR'd as before.
+  - **Serial-named folders**: a folder named by a serial that is not in the document is skipped (`_folder_named_like_other_serial()`); a name within distance 2 of a document serial (a typo) is still OCR'd.
+  - Both are logged as `Skipping OCR in N folder(s) …`.
+- Real data: 654 folders / 1,967 files (7821 + 8841), document with 43 serials of 8841 only: 1,827 photos queued for OCR (about 2 h+) → **21 s**, 43/43 tables filled.
+- 3 new tests in `test/test_auto_match.py`.
+
 ## [1.6.0] - 2026-11-17
 ### Added
 - **Auto Mode (Auto-match S/N)**: New `auto_match` option in `run_injection()` and an **Auto-match S/N (scan whole table)** checkbox (on by default). Every cell of each table is scanned for a serial matching a photo folder name, so no keyword or S/N/Image cell setup is needed and documents with different table layouts work as-is.
