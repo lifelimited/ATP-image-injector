@@ -15,7 +15,7 @@ All notable changes to this project will be documented in this file.
   - a folder where no label can be read is no longer handed to the neighbouring folder's device by shooting time; its photos stay unassigned with a `[WARN]`;
   - OCR runs on up to 4 workers, one OpenThai engine each (`OCR_GROUP_MAX_WORKERS`);
   - a single flat folder (devices mixed) is still read photo by photo and grouped by shooting time.
-- Real data, 43 devices / 129 photos in folders not named by serial (OCR grouping only): **50 s → 12 s**; photos given to the wrong device **33 → 0** (correct 89 → 108, unassigned 7 → 21).
+- Real data, 43 devices / 129 photos (mostly HEIC) in folders not named by serial (OCR grouping only): **147 s → 49 s**; photos given to the wrong device **35 → 0** (correct 87 → 129 of 129). In 1.6.0 a device shot whose label could not be read went by shooting time to whichever device was photographed at a similar time, often in another folder.
 - 4 new tests in `test/test_auto_match.py`.
 
 ## [1.6.0] - 2026-11-17
