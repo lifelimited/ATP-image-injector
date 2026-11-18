@@ -421,6 +421,27 @@ def extract_table_model(table, sn_row_col: tuple = (5, 3)) -> str | None:
     return models[0] if models else None
 
 
+_DOCX_CACHE: dict = {"key": None, "doc": None}
+_DOCX_CACHE_LOCK = threading.Lock()
+
+
+def open_docx_readonly(docx_path: str):
+    """
+    The opened Document of docx_path, loaded once and reused while the file is unchanged
+    (path, size, mtime). For read-only use in the GUI (table count, models, layout picker):
+    a document with hundreds of photos takes seconds to open. Never modify the returned object.
+    """
+    from docx import Document
+    st = os.stat(docx_path)
+    key = (os.path.abspath(docx_path), st.st_size, st.st_mtime_ns)
+    with _DOCX_CACHE_LOCK:
+        if _DOCX_CACHE["key"] == key:
+            return _DOCX_CACHE["doc"]
+        doc = Document(docx_path)
+        _DOCX_CACHE.update(key=key, doc=doc)
+        return doc
+
+
 def detect_docx_models(docx_path: str, sn_row_col: tuple = (5, 3)) -> list[str]:
     """
     Scan docx tables and return sorted unique list of detected device models
@@ -429,8 +450,7 @@ def detect_docx_models(docx_path: str, sn_row_col: tuple = (5, 3)) -> list[str]:
     if not docx_path or not os.path.isfile(docx_path):
         return []
     try:
-        from docx import Document
-        doc = Document(docx_path)
+        doc = open_docx_readonly(docx_path)
     except Exception:
         return []
 
@@ -2883,9 +2903,8 @@ class TableSelectionDialog(tk.Toplevel):
         self.buttons = {}
 
         # 1. Load Word document once and determine total tables
-        from docx import Document
         try:
-            self.doc = Document(docx_path)
+            self.doc = open_docx_readonly(docx_path)
             self.total_tables = len(self.doc.tables) if self.doc else 0
         except Exception:
             self.doc = None
@@ -3139,10 +3158,9 @@ class TableSelectionDialog(tk.Toplevel):
     def _load_table(self, docx_path: str = None, table_idx: int = 0):
         """Backwards compatibility helper."""
         if docx_path and (self.doc is None or docx_path != self.docx_path):
-            from docx import Document
             try:
                 self.docx_path = docx_path
-                self.doc = Document(docx_path)
+                self.doc = open_docx_readonly(docx_path)
                 self.total_tables = len(self.doc.tables) if self.doc else 0
             except Exception:
                 self.doc = None
@@ -3721,9 +3739,7 @@ class App(tk.Tk):
         if not docx_path or not os.path.isfile(docx_path):
             return
         try:
-            from docx import Document
-            doc = Document(docx_path)
-            total = len(doc.tables)
+            total = len(open_docx_readonly(docx_path).tables)
             curr_start = self._get_start_table()
             self._total_tables = total
             if total > 0:
@@ -3748,14 +3764,133 @@ class App(tk.Tk):
         """Triggered automatically when docx_var changes."""
         path = self.docx_var.get().strip() if hasattr(self, "docx_var") else ""
         if path and os.path.isfile(path):
-            self._update_docx_info(path)
-            self._refresh_detected_models()
+            self._start_file_scan(f"Reading Word document...\n{os.path.basename(path)}")
 
     def _on_sn_root_var_changed(self):
         """Triggered automatically when sn_root_var changes."""
         path = self.sn_root_var.get().strip() if hasattr(self, "sn_root_var") else ""
         if path and os.path.isdir(path):
-            self._refresh_detected_models()
+            name = os.path.basename(os.path.normpath(path)) or path
+            self._start_file_scan("Scanning photo folder...\n" + name)
+
+    # ── Loading the selected files in the background (a big .docx takes seconds to open) ──
+    BUSY_POPUP_DELAY_MS = 300
+
+    def _start_file_scan(self, message: str, then=None):
+        """
+        Read the table count and device models of the selected document / photo folder in a
+        worker thread, with a 'Loading...' popup, so the window does not look frozen.
+        A newer scan replaces an older one; `then` runs on the UI thread when this scan is done.
+        """
+        docx_path = self.docx_var.get().strip() if hasattr(self, "docx_var") else ""
+        sn_root = self.sn_root_var.get().strip() if hasattr(self, "sn_root_var") else ""
+        sn_row_col = self.sn_row_col
+        self._scan_gen = getattr(self, "_scan_gen", 0) + 1
+        gen = self._scan_gen
+        if then is not None:
+            self._after_scan = then
+        res: dict = {}
+
+        def work():
+            try:
+                if docx_path and os.path.isfile(docx_path):
+                    try:
+                        res["total"] = len(open_docx_readonly(docx_path).tables)
+                        res["docx_models"] = detect_docx_models(docx_path, sn_row_col=sn_row_col)
+                    except Exception as e:
+                        res["docx_err"] = e
+                if sn_root and os.path.isdir(sn_root):
+                    try:
+                        res["folder_models"] = detect_folder_models(sn_root)
+                    except Exception as e:
+                        res["folder_err"] = e
+            finally:
+                res["done"] = True
+
+        threading.Thread(target=work, daemon=True).start()
+        self._busy_message = message
+        try:
+            self.after(self.BUSY_POPUP_DELAY_MS, lambda: self._busy_show(gen))
+            self.after(50, lambda: self._poll_file_scan(gen, res, docx_path))
+        except tk.TclError:
+            pass
+
+    def _poll_file_scan(self, gen, res, docx_path):
+        try:
+            if not self.winfo_exists():
+                return
+            if gen != getattr(self, "_scan_gen", 0):
+                return                                   # replaced by a newer scan
+            if not res.get("done"):
+                self.after(80, lambda: self._poll_file_scan(gen, res, docx_path))
+                return
+            self._busy_hide()
+            if "total" in res:
+                self._update_docx_info(docx_path)        # cached document: instant
+            if "docx_err" in res:
+                self._log(f"Warning: Failed to read the Word document: {res['docx_err']}")
+            if "folder_err" in res:
+                self._log(f"Warning: Failed to detect models from folders: {res['folder_err']}")
+            docx_models = res.get("docx_models", [])
+            merged = list(docx_models)
+            for fm in res.get("folder_models", []):
+                if not any(model_matches(fm, dm) for dm in merged):
+                    merged.append(fm)
+            self.detected_models = sorted(merged)
+            self._update_models_ui(self.detected_models)
+            then, self._after_scan = getattr(self, "_after_scan", None), None
+            if then is not None:
+                then()
+        except tk.TclError:
+            pass
+
+    def _busy_show(self, gen):
+        """Small modal 'Loading...' window; only shown if the scan is still running."""
+        try:
+            if gen != getattr(self, "_scan_gen", 0) or getattr(self, "_busy_win", None) is not None:
+                if getattr(self, "_busy_win", None) is not None:
+                    self._busy_label.configure(text=self._busy_message)
+                return
+            if not self.winfo_exists():
+                return
+            C = self.COLORS
+            w = tk.Toplevel(self)
+            w.title("Loading")
+            w.transient(self)
+            w.resizable(False, False)
+            w.configure(bg=C["card"])
+            w.protocol("WM_DELETE_WINDOW", lambda: None)  # closes by itself when done
+            self._busy_label = tk.Label(w, text=self._busy_message, bg=C["card"], fg=C["text"],
+                                        font=("Segoe UI", 11), justify="center", wraplength=380)
+            self._busy_label.pack(padx=28, pady=(20, 10))
+            bar = ttk.Progressbar(w, mode="indeterminate", length=300)
+            bar.pack(padx=28, pady=(0, 8))
+            bar.start(12)
+            tk.Label(w, text="Please wait - large documents can take a while",
+                     bg=C["card"], fg=C["text_dim"], font=("Segoe UI", 9)).pack(padx=28, pady=(0, 18))
+            w.update_idletasks()
+            x = self.winfo_rootx() + (self.winfo_width() - w.winfo_reqwidth()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - w.winfo_reqheight()) // 3
+            w.geometry(f"+{max(0, x)}+{max(0, y)}")
+            try:
+                w.grab_set()
+            except tk.TclError:
+                pass
+            self._busy_win = w
+            self.configure(cursor="watch")
+        except tk.TclError:
+            pass
+
+    def _busy_hide(self):
+        w = getattr(self, "_busy_win", None)
+        self._busy_win = None
+        try:
+            self.configure(cursor="")
+            if w is not None:
+                w.grab_release()
+                w.destroy()
+        except tk.TclError:
+            pass
 
     def _refresh_detected_models(self):
         """Scan docx and folder to discover device models and update checklist."""
@@ -3867,10 +4002,10 @@ class App(tk.Tk):
             filetypes=[("Word Documents", "*.docx"), ("All Files", "*.*")]
         )
         if path:
+            # Setting the variable starts the background scan (with a Loading popup);
+            # the layout picker opens when the document has been read.
+            self._after_scan = self._configure_layout
             self.docx_var.set(path)
-            self._update_docx_info(path)
-            self._refresh_detected_models()
-            self._configure_layout()
 
     def _configure_layout(self):
         docx = self.docx_var.get().strip()
@@ -3886,15 +4021,14 @@ class App(tk.Tk):
             self.sn_row_col, self.img_row_col = dialog.result
             self.layout_label.configure(text=f"Layout: S/N at R{self.sn_row_col[0]+1}C{self.sn_row_col[1]+1} | Image at R{self.img_row_col[0]+1}C{self.img_row_col[1]+1}")
             self._log(f"Table layout configured: S/N={self.sn_row_col}, Image={self.img_row_col}")
-            self._refresh_detected_models()
+            self._start_file_scan("Updating device models...")
 
     def _pick_sn_root(self):
         path = filedialog.askdirectory(
             title="Select folder containing serial number subfolders"
         )
         if path:
-            self.sn_root_var.set(path)
-            self._refresh_detected_models()
+            self.sn_root_var.set(path)    # starts the background scan
 
     def _pick_output(self):
         path = filedialog.asksaveasfilename(
