@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.6.1-orange)
+![Version](https://img.shields.io/badge/Version-1.6.2-orange)
 ![OCR](https://img.shields.io/badge/OCR-OpenThai2.0--OCR--Text-purple)
 
 ## Overview
@@ -14,7 +14,7 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ### Key Features
 
-- **Verify Photos (beta, v1.7.0-beta.3)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.1 is the stable version
+- **Verify Photos (beta, v1.7.0-beta.4)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.2 is the stable version
 - **Auto Mode (new in v1.6.0)** — Finds the Serial Number anywhere in each table and picks the photo cell by itself. No keyword or layout setup, and it works with different table layouts in the same document
 - **Read S/N from Photos (OCR)** — Photos don't even need S/N folders: drop them into one folder and the app reads the S/N on each box label and groups the photos per device
 - **Dynamic Table Layout** — Automatically read the Word document so you can visually select where the S/N and Image cells are. No hardcoded formats!
@@ -29,7 +29,7 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ### Option 1: Windows .exe (easiest, no install)
 
-1. Download **`Unit_Test_Image_Injector_v1.6.1.exe`** from the [latest release](../../releases/latest) (~148 MB; OCR model included, no Python needed).
+1. Download **`Unit_Test_Image_Injector_v1.6.2.exe`** from the [latest release](../../releases/latest) (~148 MB; OCR model included, no Python needed).
 2. Double-click to run. Windows SmartScreen may ask once: *More info → Run anyway*.
 3. Pick the Word document and the photo folder, then click **▶ Run Injection**. Click **❓ วิธีใช้** for the Thai guide.
 
@@ -170,7 +170,7 @@ Click **■ Stop** at any time to cancel. Any images already inserted will be sa
 The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
 
 ```bash
-Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
+Unit_Test_Image_Injector_v1.6.2.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
 ```
 
 Options: `--verify`, `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
@@ -267,10 +267,10 @@ The app natively parses the first table in your Word document and displays it in
 pip install pyinstaller
 
 # Build standalone executable (bundles the OpenThai OCR model + its runtime imports)
-python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.1" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.2" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
 ```
 
-The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.1.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
+The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.2.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
 
 ## Requirements
 
@@ -307,6 +307,9 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
+### v1.7.0-beta.4 (Pre-release)
+- Includes the v1.6.2 fix (`By_Number/<n>` folders).
+
 ### v1.7.0-beta.3 (Pre-release)
 - ⏱ **Time left while running** — the status shows the current step and an estimate (`Inserting photos... 61/129 · about 35 s left`); within ±10% of the run time from 30% on in real-data tests once the speeds of the computer are learned.
 - ⏳ Loading popup when a document / photo folder is picked (no frozen window), also in v1.6.1.
@@ -320,7 +323,10 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 - ⚡ **Parallel Verify OCR** — up to 4 workers (48 photos 75 → 47 s).
 - ✅ 16 new tests.
 
-### v1.6.1 (Current stable)
+### v1.6.2 (Current stable)
+- 🗂 **`By_Number/<n>` folders work** — folders named only by a number (`Model/By_Number/12/`) are ชุดที่ folders; before, the same numbers of different models collided and a model's photos were dropped (real data: 285 → 338 of 453 tables, S5755 1 → 30/30).
+
+### v1.6.1
 - ⏳ **No more frozen window when picking files** — the document / photo folder is read in the background with a *Loading...* popup, and Configure Layout opens instantly.
 - ⚡ **Read S/N from photos: no OCR of other devices' folders** — model folders (`7821/`, `8841/`) whose model is not in the document or is unticked in the Device Models filter, and folders named by a serial that is not in the document, are skipped. A photo root of a whole project used with a document of 43 devices: about 2 h → 21 s.
 - 🚀 **Faster, safer OCR grouping** — per-device folders stop at the first S/N label and run on 4 OCR workers; a folder whose label can't be read is no longer given to the neighbouring device (43 devices: 147 s → 49 s, photos on the wrong device 35 → 0).
