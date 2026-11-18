@@ -14,6 +14,7 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ### Key Features
 
+- **Verify Photos (beta, v1.7.0-beta)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.0 stays the stable version
 - **Auto Mode (new in v1.6.0)** — Finds the Serial Number anywhere in each table and picks the photo cell by itself. No keyword or layout setup, and it works with different table layouts in the same document
 - **Read S/N from Photos (OCR)** — Photos don't even need S/N folders: drop them into one folder and the app reads the S/N on each box label and groups the photos per device
 - **Dynamic Table Layout** — Automatically read the Word document so you can visually select where the S/N and Image cells are. No hardcoded formats!
@@ -306,7 +307,13 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
-### v1.6.0 (Current)
+### v1.7.0-beta (Pre-release)
+- 🔎 **Verify Photos (OCR every folder)** — Optional checkbox / `--verify`: photos in S/N and set-number folders are OCR'd too, and a photo of another device goes into that device's table. Strict by design: only an exact or near-exact label read moves a photo, look-alike serials need a zoomed re-read on 2 photos, swapped folders are solved as a pair, and a single stray label photo never drags the folder's other photos. Only the Word output changes.
+- 📄 **Summary report** — new *Photos moved (wrong folder)* section.
+- ⚡ **Parallel Verify OCR** — up to 4 workers (48 photos 75 → 47 s).
+- ✅ 16 new tests.
+
+### v1.6.0 (Current stable)
 - 🔎 **Auto Mode** — Matches the S/N anywhere in each table and detects the photo cell automatically. Summary tables are skipped and `[FIND]` log lines show which cells were used.
 - 📂 **Nested Folder Scan** — Finds S/N folders at any depth (`Model/By_SN/<serial>/`), ignores `195-280` sequence folders, and includes photos in the selected folder itself.
 - 📷 **Read S/N from Photos (OCR)** — Groups unsorted photos per device by reading the S/N on the box label, tolerating small OCR errors. Unread photos go to the device shot closest in time (EXIF), so the label can be shot before or after the device photos.
