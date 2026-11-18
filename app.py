@@ -1529,10 +1529,15 @@ def verify_folder_photos(folders: list[dict], doc_serials: dict[str, str], engin
         if len(others) == 1 and not any(k == own for _p, k, _h in reads):
             target = next(iter(others))
             n_lab = len(foreign)
+            # With a single label photo the unread photos may still be the folder's own device (e.g. a stray
+            # label photo next to an unreadable wide shot): they are marked 'weak' and only move when the
+            # target's folder in turn shows this folder's device (a swap, see resolve_photo_moves).
+            weak = n_lab < 2
             for p, _k, _h in reads:
                 why = (f"S/N label read {doc_serials[target]}" if p in foreign
                        else f"whole folder shows {doc_serials[target]} ({n_lab} label photo(s))")
-                proposals.append({"folder": f_idx, "path": p, "to": target, "reason": why, "whole": True})
+                proposals.append({"folder": f_idx, "path": p, "to": target, "reason": why, "whole": True,
+                                  "weak": weak and p not in foreign})
             continue
 
         # Mixed folder: labels decide; unread photos follow a label shot close by (time chain)
@@ -1658,6 +1663,25 @@ def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holder
         if f.get("expected"):
             holders.setdefault(f["expected"], []).append(i)
     accepted = list(proposals) + _swap_pair_proposals(folders, proposals, holders, doc_serials, log)
+
+    # Unread photos of a folder with only one foreign label photo ('weak') move only in a swap:
+    # the target's own folder moves whole to this folder's device.
+    whole_to: dict[int, str] = {}
+    for pr in accepted:
+        if pr.get("whole"):
+            whole_to.setdefault(pr["folder"], pr["to"])
+    mutual = {fi for fi, to in whole_to.items()
+              if any(whole_to.get(h) == folders[fi].get("expected") for h in holders.get(to, []))}
+    kept, dropped = [], {}
+    for pr in accepted:
+        if pr.get("weak") and pr["folder"] not in mutual:
+            dropped.setdefault(pr["folder"], []).append(pr)
+            continue
+        kept.append(pr)
+    for fi, prs in dropped.items():
+        log(f"    [VERF] folder {folders[fi]['name']}: only 1 label photo shows {doc_serials.get(prs[0]['to'], prs[0]['to'])}"
+            f" - that photo is moved, {len(prs)} unread photo(s) stay in the folder")
+    accepted = kept
     proposals = accepted[:]
     rejected_why: dict[str, str] = {}
     while True:
@@ -2145,8 +2169,9 @@ def _verify_and_move_photos(doc, sn_root: str, sn_folders: dict, sn_to_model: di
         if model and not sn_to_model.get(new_name):
             sn_to_model[new_name] = model
         moved_out.pop(target, None)
+        emptied = all(p in by_src.get(prs[0]["folder"], set()) for p in src["imgs"])
         log(f"  [MOVE] {len(prs)} photo(s) from folder {src['name']} -> S/N {new_name}"
-            + (" (whole folder)" if prs[0]["whole"] else ""))
+            + (" (whole folder)" if emptied else ""))
         for pr in prs:
             report_moved.append({"photo": os.path.relpath(pr["path"], sn_root), "from": src["name"],
                                  "to": new_name, "reason": pr["reason"]})
