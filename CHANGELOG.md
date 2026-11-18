@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [1.7.0-beta.2] - 2026-11-18 (pre-release)
+v1.7.0-beta plus the fixes of v1.6.1.
 ### Changed
 - **Read S/N from photos is faster and safer in per-device folders** (2+ sibling folders, up to 12 photos each): reading stops at the first exact S/N label and the folder's other photos get that serial; a folder where no label can be read stays unassigned with a `[WARN]` instead of going to the neighbouring folder's device by shooting time; OCR runs on up to 4 workers. A single flat folder is still read photo by photo. Real data, 43 devices / 129 photos (mostly HEIC): OCR grouping 147 s → 49 s, wrong device 35 → 0, all 129 correct (also in 1.6.1).
 ### Fixed
