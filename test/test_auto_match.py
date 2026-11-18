@@ -293,6 +293,13 @@ def test_group_photos_stops_at_first_label_per_device_folder(tmp_path):
     assert (0, 255, 0) not in reads                       # device shots never OCR'd
     assert any("4 photo(s) not OCR'd" in m for m in logs)
 
+    # A device folder with no readable label is not handed to the neighbouring folder's device
+    c = str(tmp_path / "dev3")
+    more = imgs + [_photo(os.path.join(c, "7.png"), (0, 255, 0)), _photo(os.path.join(c, "8.png"), (0, 255, 0))]
+    groups, unassigned = app.group_photos_by_ocr(more, ser, engine=eng)
+    assert sorted(os.path.basename(p) for p in unassigned) == ["7.png", "8.png"]
+    assert len(groups["BBB7654321"]) == 3
+
     # One flat folder (devices mixed): every photo is read
     reads.clear()
     d = str(tmp_path / "all")

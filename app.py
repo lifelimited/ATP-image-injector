@@ -1378,7 +1378,20 @@ def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=N
                         folder_filled += 1
     if folder_filled:
         log(f"    {folder_filled} photo(s) without a read S/N given to the S/N read in their folder")
-    reads: list[tuple[str, str | None]] = [(p, results[p][0]) for p in images if p in results]
+    # Per-device folders where no photo could be read stay unassigned: by shooting time they would
+    # go to the device of a neighbouring folder (a wrong photo is worse than a missing one).
+    no_label: list[str] = []
+    if early_stop:
+        for d, paths in by_dir.items():
+            if paths and not any(p in results and results[p][0] for p in paths):
+                no_label.extend(p for p in paths if p in results)
+        if no_label:
+            log(f"    [WARN] {len(no_label)} photo(s) in {len({os.path.dirname(p) for p in no_label})} folder(s) "
+                f"where no S/N label could be read - not assigned: "
+                + ", ".join(sorted({os.path.basename(os.path.dirname(p)) for p in no_label})[:5]))
+    skip_set = set(no_label)
+    reads: list[tuple[str, str | None]] = [(p, results[p][0]) for p in images
+                                            if p in results and p not in skip_set]
     sticker_reads: dict[str, str] = {  # path -> 'N/T' for photos identified only by a set sticker
         p: how.split()[1].replace("+zoom", "") for p, (key, how) in results.items()
         if key and how.startswith("sticker")}
@@ -1429,6 +1442,7 @@ def group_photos_by_ocr(images: list[str], doc_serials: dict[str, str], engine=N
     n_unread = sum(1 for _, k in reads if not k)
     if n_unread - len(unassigned) > 0:
         log(f"    {n_unread - len(unassigned)} photo(s) without readable S/N assigned by {method}")
+    unassigned = unassigned + no_label
 
     # Same serial read in two separate places of the sequence -> warn (photos still grouped)
     seen_runs = []

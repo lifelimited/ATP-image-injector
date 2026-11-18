@@ -9,7 +9,14 @@ All notable changes to this project will be documented in this file.
   - **Serial-named folders**: a folder named by a serial that is not in the document is skipped (`_folder_named_like_other_serial()`); a name within distance 2 of a document serial (a typo) is still OCR'd.
   - Both are logged as `Skipping OCR in N folder(s) …`.
 - Real data: 654 folders / 1,967 files (7821 + 8841), document with 43 serials of 8841 only: 1,827 photos queued for OCR (about 2 h+) → **21 s**, 43/43 tables filled.
-- 3 new tests in `test/test_auto_match.py`.
+### Changed
+- **Read S/N from photos is faster and safer in per-device folders** (2+ sibling folders, up to 12 photos each):
+  - reading stops at the first exact S/N label of a folder, and the folder's other photos get that serial (`OCR_EARLY_STOP_MAX_PHOTOS`);
+  - a folder where no label can be read is no longer handed to the neighbouring folder's device by shooting time; its photos stay unassigned with a `[WARN]`;
+  - OCR runs on up to 4 workers, one OpenThai engine each (`OCR_GROUP_MAX_WORKERS`);
+  - a single flat folder (devices mixed) is still read photo by photo and grouped by shooting time.
+- Real data, 43 devices / 129 photos in folders not named by serial (OCR grouping only): **50 s → 12 s**; photos given to the wrong device **33 → 0** (correct 89 → 108, unassigned 7 → 21).
+- 4 new tests in `test/test_auto_match.py`.
 
 ## [1.6.0] - 2026-11-17
 ### Added
