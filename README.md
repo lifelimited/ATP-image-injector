@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?logo=windows)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-1.6.1-orange)
+![Version](https://img.shields.io/badge/Version-1.6.2-orange)
 ![OCR](https://img.shields.io/badge/OCR-OpenThai2.0--OCR--Text-purple)
 
 ## Overview
@@ -131,7 +131,7 @@ Click **■ Stop** at any time to cancel. Any images already inserted will be sa
 The same `app.py` / `.exe` runs headless with `--cli` (always Auto mode):
 
 ```bash
-Unit_Test_Image_Injector_v1.6.1.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
+Unit_Test_Image_Injector_v1.6.2.exe --cli --docx "doc.docx" --photos "C:\Photos" --out "out.docx" --log run.log
 ```
 
 Options: `--no-ocr`, `--no-set-fallback`, `--no-smart-rotate`, `--original-size`, `--workers N`, `--start-table N`. The windowed exe has no console, so use `--log` to see progress. Exit code `0` means images were injected.
@@ -221,10 +221,10 @@ The app natively parses the first table in your Word document and displays it in
 pip install pyinstaller
 
 # Build standalone executable (bundles the OpenThai OCR model + its runtime imports)
-python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.1" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.2" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
 ```
 
-The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.1.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
+The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.2.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
 
 ## Requirements
 
@@ -261,7 +261,10 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
-### v1.6.1 (Current)
+### v1.6.2 (Current)
+- 🗂 **`By_Number/<n>` folders work** — folders named only by a number (`Model/By_Number/12/`) are ชุดที่ folders; before, the same numbers of different models collided and a model's photos were dropped (real data: 285 → 338 of 453 tables, S5755 1 → 30/30).
+
+### v1.6.1
 - ⏳ **No more frozen window when picking files** — the document / photo folder is read in the background with a *Loading...* popup, and Configure Layout opens instantly.
 - ⚡ **Read S/N from photos: no OCR of other devices' folders** — model folders (`7821/`, `8841/`) whose model is not in the document or is unticked in the Device Models filter, and folders named by a serial that is not in the document, are skipped. A photo root of a whole project used with a document of 43 devices: about 2 h → 21 s.
 - 🚀 **Faster, safer OCR grouping** — per-device folders stop at the first S/N label and run on 4 OCR workers; a folder whose label can't be read is no longer given to the neighbouring device (43 devices: 147 s → 49 s, photos on the wrong device 35 → 0).
