@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [1.7.0-beta.3] - 2026-11-18 (pre-release)
 ### Fixed
 - **The window no longer freezes while a document or photo folder is loaded.** Picking a .docx opened it up to 5 times on the UI thread (a 613-table document with photos takes ~8 s per open). It is now read once in the background with a small *Loading...* popup (file name and a moving bar, shown only when loading takes over 0.3 s), and the opened document is cached for the table count, device models and Configure Layout (`open_docx_readonly()`), which now opens instantly.
 

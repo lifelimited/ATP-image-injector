@@ -14,7 +14,7 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ### Key Features
 
-- **Verify Photos (beta, v1.7.0-beta.2)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.1 is the stable version
+- **Verify Photos (beta, v1.7.0-beta.3)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.1 is the stable version
 - **Auto Mode (new in v1.6.0)** — Finds the Serial Number anywhere in each table and picks the photo cell by itself. No keyword or layout setup, and it works with different table layouts in the same document
 - **Read S/N from Photos (OCR)** — Photos don't even need S/N folders: drop them into one folder and the app reads the S/N on each box label and groups the photos per device
 - **Dynamic Table Layout** — Automatically read the Word document so you can visually select where the S/N and Image cells are. No hardcoded formats!
@@ -307,6 +307,9 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 
 ## Changelog
 
+### v1.7.0-beta.3 (Pre-release)
+- ⏳ Loading popup when a document / photo folder is picked (no frozen window), also in v1.6.1.
+
 ### v1.7.0-beta.2 (Pre-release)
 - Includes the v1.6.1 fixes (faster, safer Read S/N from photos).
 
@@ -317,6 +320,7 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 - ✅ 16 new tests.
 
 ### v1.6.1 (Current stable)
+- ⏳ **No more frozen window when picking files** — the document / photo folder is read in the background with a *Loading...* popup, and Configure Layout opens instantly.
 - ⚡ **Read S/N from photos: no OCR of other devices' folders** — model folders (`7821/`, `8841/`) whose model is not in the document or is unticked in the Device Models filter, and folders named by a serial that is not in the document, are skipped. A photo root of a whole project used with a document of 43 devices: about 2 h → 21 s.
 - 🚀 **Faster, safer OCR grouping** — per-device folders stop at the first S/N label and run on 4 OCR workers; a folder whose label can't be read is no longer given to the neighbouring device (43 devices: 147 s → 49 s, photos on the wrong device 35 → 0).
 
