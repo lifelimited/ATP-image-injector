@@ -12,28 +12,6 @@
 
 This tool automates the process of inserting device photos into Unit Test Word documents (`.docx`). Instead of manually copying and pasting hundreds of images, simply organize your photos into Serial Number folders and let the app do the rest.
 
-### How it works
-
-```mermaid
-flowchart TD
-    A["Word document<br/>+ photo folder"] --> B["Scan folders<br/>S/N · By_Number/n<br/>· other folders"]
-    B --> C["Read Word document<br/>S/N list · models<br/>· ชุดที่ N/T"]
-    C --> E["Read S/N from photos<br/>OCR only unknown photos<br/>skips other models"]
-    E --> F["Match photos to tables"]
-    F --> G["Prepare photos<br/>rotate · shrink · 4 workers"]
-    G --> H["Save Word file<br/>+ summary report"]
-```
-
-1. **Read the document first.** Every S/N in the Word file, its device models and its ชุดที่ (N/T) numbers are read before any photo is OCR'd. OCR only accepts a serial that is in the document, and model folders that are not in the document are skipped entirely.
-2. **Match each table to its photos**, most reliable source first:
-
-```mermaid
-flowchart LR
-    S["S/N folder<br/>folder name"] --> L["OCR label<br/>S/N on the box"] --> K["N/T sticker<br/>set-number sticker"] --> T["Time gap<br/>shot next to a label"] --> N["ชุดที่ folder<br/>By_Number/n<br/>12-280"]
-```
-
-3. **Only the Word output changes.** Your photos and folders are never moved, renamed or edited; a summary report (`<output>_summary.txt`) lists which tables got photos, which are missing and why.
-
 ### Key Features
 
 - **Auto Mode (new in v1.6.0)** — Finds the Serial Number anywhere in each table and picks the photo cell by itself. No keyword or layout setup, and it works with different table layouts in the same document
@@ -45,6 +23,17 @@ flowchart LR
 - **Stop Button** — Cancel processing at any time; partial progress is saved
 - **Portable** — Standalone `.exe` file, no Python installation required
 - **Dark Theme UI** — Modern, clean interface with progress tracking and color-coded logs
+
+### How it works
+
+![How it works: inputs, scan folders, read the Word document, OCR, match, prepare, save](docs/how_it_works.svg)
+
+1. **Read the document first.** Every S/N in the Word file, its device models and its ชุดที่ (N/T) numbers are read before any photo is OCR'd. OCR only accepts a serial that is in the document, and model folders that are not in the document are skipped entirely.
+2. **Match each table to its photos**, most reliable source first:
+
+![Matching order: S/N folder, OCR label, N/T sticker, time gap, ชุดที่ folder](docs/matching_order.svg)
+
+3. **Only the Word output changes.** Your photos and folders are never moved, renamed or edited; a summary report (`<output>_summary.txt`) lists which tables got photos, which are missing and why.
 
 ## Quick Start
 
