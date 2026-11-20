@@ -643,7 +643,7 @@ def test_parse_set_folder_names():
     assert f("ชุดที่ 12/280") == (12, 280, True) and f("No.12") == (12, None, True)
     assert f("#12") == (12, None, True) and f("Set 3") == (3, None, True)
     assert f("ลำดับที่ ๑๒") == (12, None, True)
-    for bad in ("WZP00000AAD", "IMG_0001", "photos", "2024-11-18 trip", "12345"):
+    for bad in ("ZZZ9990001X", "IMG_0001", "photos", "2024-11-18 trip", "12345"):
         assert f(bad) is None, bad
 
 
