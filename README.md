@@ -12,6 +12,37 @@
 
 This tool automates the process of inserting device photos into Unit Test Word documents (`.docx`). Instead of manually copying and pasting hundreds of images, simply organize your photos into Serial Number folders and let the app do the rest.
 
+### How it works
+
+```mermaid
+flowchart TD
+    A["Word document<br/>+ photo folder"] --> B["Scan folders<br/>S/N · By_Number/n<br/>· other folders"]
+    B --> C["Read Word document<br/>S/N list · models<br/>· ชุดที่ N/T"]
+    C --> E["Read S/N from photos<br/>OCR only unknown photos<br/>skips other models"]
+    E --> F["Match photos to tables"]
+    E -.optional.-> V["Verify photos<br/>photos in the<br/>wrong folder"]
+    V -.-> F
+    F --> G["Prepare photos<br/>rotate · shrink · 4 workers"]
+    G --> H["Save Word file<br/>+ summary report"]
+
+    classDef doc fill:#FAECE7,stroke:#993C1D,color:#712B13
+    classDef find fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    classDef build fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    class C doc
+    class B,E,V find
+    class F,G build
+```
+
+1. **Read the document first.** Every S/N in the Word file, its device models and its ชุดที่ (N/T) numbers are read before any photo is OCR'd. OCR only accepts a serial that is in the document, and model folders that are not in the document are skipped entirely.
+2. **Match each table to its photos**, most reliable source first:
+
+```mermaid
+flowchart LR
+    S["S/N folder<br/>folder name"] --> L["OCR label<br/>S/N on the box"] --> K["N/T sticker<br/>set-number sticker"] --> T["Time gap<br/>shot next to a label"] --> N["ชุดที่ folder<br/>By_Number/n<br/>12-280"]
+```
+
+3. **Only the Word output changes.** Your photos and folders are never moved, renamed or edited; a summary report (`<output>_summary.txt`) lists which tables got photos, which are missing and why.
+
 ### Key Features
 
 - **Verify Photos (beta, v1.7.0-beta.4)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.2 is the stable version
