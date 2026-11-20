@@ -1968,7 +1968,14 @@ def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holder
 # ─────────────────────────────────────────────
 # Auto Mode fallback: set-number folders ('ชุดที่ 12/280' <-> folder '12-280')
 # ─────────────────────────────────────────────
-SET_LABEL_REGEX = re.compile(r"^\s*(?:ชุด\s*ที่|set\s*(?:no\.?)?|unit\s*(?:no\.?)?)\s*[:.]?\s*$", re.IGNORECASE)
+SET_LABEL_REGEX = re.compile(r"^\s*(?:ชุด\s*ที่|ลำดับ\s*ที่|set\s*(?:no\.?)?|unit\s*(?:no\.?)?)\s*[:.]?\s*$", re.IGNORECASE)
+# "ชุดที่ 12/280" or "ลำดับที่ 12" written inside a longer cell (label and number in one cell)
+SET_INLINE_REGEX = re.compile(r"(?:ชุด|ลำดับ)\s*ที่\s*[:.]?\s*(\d{1,4})(?:\s*/\s*(\d{1,4}))?")
+SET_PLAIN_VALUE_REGEX = re.compile(r"^\s*(\d{1,4})\s*$")
+PN_INLINE_REGEX = re.compile(r"(?:\bP\s*/\s*N|Part\s*(?:Number|No\.?))\s*[:.]\s*(\S+)", re.IGNORECASE)
+NAME_INLINE_REGEX = re.compile(r"\b(?:Name|Model|รายการ)\s*[:.]\s*(\S+)", re.IGNORECASE)
+COLUMN_HEADER_REGEX = re.compile(r"^\s*(?:detail|expected\s*status|status|result|remark|ผล.*|หมายเหตุ)\s*$", re.IGNORECASE)
+SET_HEAD_ROWS = 6          # the ชุดที่/ลำดับที่ header is in the first rows of a detail table
 SET_VALUE_REGEX = re.compile(r"^\s*(\d{1,4})\s*/\s*(\d{1,4})\s*$")
 PN_LABEL_REGEX = re.compile(r"^\s*(?:part\s*(?:number|no\.?)|p\s*/\s*n)\s*[:.]?\s*$", re.IGNORECASE)
 ITEM_LABEL_REGEX = re.compile(r"^\s*(?:รายการ|item|description|model)\s*[:.]?\s*$", re.IGNORECASE)
@@ -1977,8 +1984,13 @@ GENERIC_FOLDER_REGEX = re.compile(r"^(?:by[\s_-]*(?:number|num|no|sn|serial)|num
 
 def extract_set_entries(doc) -> list[dict]:
     """
-    One entry per detail table that has a 'ชุดที่ : N/T' row:
-      {t_idx, n, total, pn, item, sn, last_row, group, index, group_total}
+    One entry per detail table numbered by set, in any of these forms:
+      'ชุดที่ :' | 'N/T'   (label and value in two cells; also 'ลำดับที่')
+      'ลำดับที่ 12 ... Name : X ... P/N : Y'   (all in one merged header cell, no total)
+      'Part Number' / 'Serial Number' column headers with the values in the row below.
+    {t_idx, n, total, pn, item, sn, last_row, group, index, group_total}
+    Without a total ('ลำดับที่ N'), each device group is numbered 1..k in document order and
+    total = k (numbering may restart per model or run on across models).
     Tables of the same Part Number (else same รายการ) form one device group. When a group is
     split over several sections (e.g. 1/229 ... 229/229 then 1/51 ... 51/51 of the same PN),
     'index' numbers it continuously in document order (1..280) and group_total is the sum.
@@ -1993,11 +2005,15 @@ def extract_set_entries(doc) -> list[dict]:
             cells = rows[r]
             for i in range(len(cells) - 1):
                 label, value = cells[i][1], cells[i + 1][1]
-                if not value:
+                if not value or _is_field_label(value):
                     continue
                 m = SET_VALUE_REGEX.match(value)
-                if SET_LABEL_REGEX.match(label) and m and "n" not in info:
-                    info.update(n=int(m.group(1)), total=int(m.group(2)))
+                mp = SET_PLAIN_VALUE_REGEX.match(value)
+                if SET_LABEL_REGEX.match(label) and (m or mp) and "n" not in info:
+                    if m:
+                        info.update(n=int(m.group(1)), total=int(m.group(2)))
+                    else:
+                        info.update(n=int(mp.group(1)), total=None)
                 elif PN_LABEL_REGEX.match(label):
                     info.setdefault("pn", value)
                 elif ITEM_LABEL_REGEX.match(label):
@@ -2007,9 +2023,21 @@ def extract_set_entries(doc) -> list[dict]:
                 else:
                     continue
                 info["last_row"] = max(info.get("last_row", 0), r)
-        if "n" in info and 1 <= info["n"] <= info["total"]:
+        _fill_inline_set_fields(rows, info)
+        if "n" in info and (info["total"] is None and info["n"] >= 1
+                            or info["total"] is not None and 1 <= info["n"] <= info["total"]):
             info["t_idx"] = t_idx
             entries.append(info)
+
+    # 'ลำดับที่ N' without a total: number each device group 1..k in document order
+    open_groups: dict[str, list] = {}
+    for e in entries:
+        if e["total"] is None:
+            key = normalize_sn(e.get("pn")) or e.get("item", "").strip() or "?"
+            open_groups.setdefault(key, []).append(e)
+    for members in open_groups.values():
+        for rank, e in enumerate(sorted(members, key=lambda x: (x["n"], x["t_idx"])), start=1):
+            e["n_doc"], e["n"], e["total"] = e["n"], rank, len(members)
 
     # Continuous numbering per device group
     segments: dict[str, list] = {}
@@ -2025,6 +2053,49 @@ def extract_set_entries(doc) -> list[dict]:
         e["index"] = sum(t for _, t in segs[:seg_i]) + e["n"]
         e["group_total"] = sum(t for _, t in segs)
     return entries
+
+
+def _is_field_label(text: str) -> bool:
+    return bool(PN_LABEL_REGEX.match(text) or SERIAL_LABEL_REGEX.match(text) or ITEM_LABEL_REGEX.match(text)
+                or SET_LABEL_REGEX.match(text) or COLUMN_HEADER_REGEX.match(text))
+
+
+def _fill_inline_set_fields(rows: dict, info: dict):
+    """
+    Set number, P/N, name and S/N written inside one cell ('ลำดับที่ 1 ... Name : X  P/N : Y')
+    or as column headers with the value in the row below ('Part Number' over 'CP-8841-K9=').
+    Only fills what the label/value-pair scan did not find.
+    """
+    head = sorted(rows)[:SET_HEAD_ROWS]
+    for r in head:
+        for _c, text in rows[r]:
+            if "n" not in info:
+                m = SET_INLINE_REGEX.search(text)
+                if m:
+                    info.update(n=int(m.group(1)), total=int(m.group(2)) if m.group(2) else None)
+                    info["last_row"] = max(info.get("last_row", 0), r)
+            if "pn" not in info:
+                m = PN_INLINE_REGEX.search(text)
+                if m:
+                    info["pn"] = m.group(1)
+            if "item" not in info:
+                m = NAME_INLINE_REGEX.search(text)
+                if m:
+                    info["item"] = m.group(1)
+    if "n" not in info:
+        return
+    order = sorted(rows)
+    for i, r in enumerate(order[:-1]):
+        below = dict(rows[order[i + 1]])
+        for c, text in rows[r]:
+            value = below.get(c, "").strip()
+            if not value or _is_field_label(value):
+                continue
+            if "pn" not in info and PN_LABEL_REGEX.match(text):
+                info["pn"] = value
+            elif "sn" not in info and SERIAL_LABEL_REGEX.match(text):
+                info["sn"] = value
+                info["last_row"] = max(info.get("last_row", 0), order[i + 1])
 
 
 def find_set_number_folders(root: str) -> list[dict]:

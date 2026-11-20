@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Added
+- **`ลำดับที่` documents work with the ชุดที่ fallback.** Set numbers are now read in any of these forms: `ชุดที่ :` | `N/T` in two cells (as before), `ลำดับที่ :` | `N`, or `ลำดับที่ N` inside a longer merged header cell together with `Name : X` / `P/N : Y`; `Part Number` / `Serial Number` column headers with the value in the row below are read too (`_fill_inline_set_fields()`). Without a total, each device group (by P/N, else name) is numbered 1..k in document order and total = k, so numbering that restarts per model or runs on across models both work. Real IP-phone documents with `By_Number/<n>` photo folders (hard-link copies): 43/43 and 611/611 tables filled (was 0), every table with the photo count of its own S/N.
 
 ## [1.7.0-beta.4] - 2026-11-19 (pre-release)
 ### Fixed
