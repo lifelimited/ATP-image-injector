@@ -576,6 +576,64 @@ def test_plain_number_folders_under_by_number_are_set_folders(tmp_path):
     assert [_count_pictures(d.tables[i]) for i in (1, 2, 3, 4)] == [1, 1, 1, 2]
     assert not any(m.startswith("OCR: reading") for m in logs)
 
+
+def _lamdab_doc(path, serials, pn="CP-8841-K9="):
+    """IP-phone style: 'ลำดับที่ N ... Name : X  P/N : X' in one merged header cell,
+    'Part Number' / 'Serial Number' column headers with values below, photo row at the end."""
+    doc = Document()
+    for i, sn in enumerate(serials, start=1):
+        t = doc.add_table(rows=7, cols=4)
+        t.rows[0].cells[0].merge(t.rows[0].cells[3]).text = (
+            f"ลำดับที่ {i}        ผลการพิจารณา  ผ่าน  ไม่ผ่าน\nName : {pn}        P/N : {pn}")
+        for c, h in enumerate(["", "Detail", "Part Number", "Serial Number"]):
+            t.rows[2].cells[c].text = h
+        for c, v in enumerate(["1.1", "Cisco IP Phone", pn, sn]):
+            t.rows[3].cells[c].text = v
+        for c, h in enumerate(["Item", "Expected Status", "Result"]):
+            t.rows[4].cells[c].text = h
+        row = t.rows[6]
+        row.cells[0].merge(row.cells[3])
+    doc.save(path)
+
+
+def test_lamdab_thi_tables_are_set_entries_and_use_by_number_folders(tmp_path):
+    """'ลำดับที่ N' (no total) works like 'ชุดที่ N/T': numbered per model, total = tables of the model."""
+    p = str(tmp_path / "d.docx")
+    _lamdab_doc(p, ["AAA1234567", "BBB7654321", "CCC1112223"])
+    entries = app.extract_set_entries(Document(p))
+    assert [(e["n"], e["total"], e["pn"], e["sn"]) for e in entries] == [
+        (1, 3, "CP-8841-K9=", "AAA1234567"), (2, 3, "CP-8841-K9=", "BBB7654321"), (3, 3, "CP-8841-K9=", "CCC1112223")]
+    assert all(e["item"] == "CP-8841-K9=" for e in entries)        # not the 'Expected Status' header
+
+    root = tmp_path / "photos"
+    for n in (1, 2, 3):
+        _make_photo(str(root / "8841" / "By_Number" / str(n)), f"p{n}.jpg")
+    _make_photo(str(root / "8841" / "By_Number" / "2"), "p2b.jpg")
+    out = tmp_path / "o.docx"
+    logs = []
+    res = app.run_injection(p, str(root), str(out), auto_match=True, photo_ocr=True, set_number_fallback=True,
+                            auto_rotate=False, smart_rotate=False, log_callback=logs.append)
+    assert res.injected == 3 and res.img_count == 4 and not res.errors
+    d = Document(str(out))
+    assert [_count_pictures(d.tables[i]) for i in range(3)] == [1, 2, 1]
+
+
+def test_lamdab_thi_numbering_running_on_across_models(tmp_path):
+    """Numbering that runs on across models (1-2 for one model, 3-4 for the next) restarts per model."""
+    doc_path = str(tmp_path / "d.docx")
+    _lamdab_doc(doc_path, ["AAA1234567", "BBB7654321"], pn="CP-7821-K9=")
+    d = Document(doc_path)
+    tmp2 = str(tmp_path / "d2.docx")
+    _lamdab_doc(tmp2, ["CCC1112223", "DDD4445556"], pn="CP-8841-K9=")
+    for t in Document(tmp2).tables:
+        d.element.body.append(t._tbl)
+    for i, t in enumerate(d.tables[2:], start=3):
+        t.rows[0].cells[0].text = t.rows[0].cells[0].text.replace(f"ลำดับที่ {i - 2}", f"ลำดับที่ {i}")
+    d.save(doc_path)
+    entries = app.extract_set_entries(Document(doc_path))
+    assert [(e["pn"], e["n"], e["total"], e.get("n_doc")) for e in entries] == [
+        ("CP-7821-K9=", 1, 2, 1), ("CP-7821-K9=", 2, 2, 2), ("CP-8841-K9=", 1, 2, 3), ("CP-8841-K9=", 2, 2, 4)]
+
 def test_assign_unread_far_from_any_label_stays_unassigned():
     """Mixed devices: other devices' photos (labels unreadable) shot minutes away are not pulled in."""
     seq = [("A", "A"), ("a1", None), ("s1", None), ("s2", None), ("B", "B"), ("x1", None), ("x2", None)]

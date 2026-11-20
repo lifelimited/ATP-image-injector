@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+### Added
+- **`ลำดับที่` documents work with the ชุดที่ fallback.** Set numbers are now read in any of these forms: `ชุดที่ :` | `N/T` in two cells (as before), `ลำดับที่ :` | `N`, or `ลำดับที่ N` inside a longer merged header cell together with `Name : X` / `P/N : Y`; `Part Number` / `Serial Number` column headers with the value in the row below are read too (`_fill_inline_set_fields()`). Without a total, each device group (by P/N, else name) is numbered 1..k in document order and total = k, so numbering that restarts per model or runs on across models both work. Real IP-phone documents with `By_Number/<n>` photo folders (hard-link copies): 43/43 and 611/611 tables filled (was 0), every table with the photo count of its own S/N.
+
 ## [1.6.2] - 2026-11-19
 ### Fixed
 - **Photos in `Model/By_Number/<n>/` folders were lost or OCR'd for nothing.** A folder named only by a number (no `-total`, e.g. `S5755-H24UM4Y2CZ/by_Number/12/`) was taken as a serial folder named `12`, so the same numbers of different models collided (`[WARN] 53 duplicate folder name(s), using first`) and one model's photos were dropped, and all such photos went through OCR. They are now ชุดที่ folders: set n, total = the number of numbered sibling folders or the highest number (`_plain_set_number()`), mapped by model name and total like `12-280` folders. Real data (OneDrive export, 5 model folders, `By_SN` folders empty): 285 → 338 of 453 tables with photos, S5755 1 → 30 of 30, OCR 781 → 221 photos.
