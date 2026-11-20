@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [1.7.0-beta.5] - 2026-11-20 (pre-release)
 ### Added
 - **More set-number folder names**: besides `12-280` and `By_Number/12`, these are ชุดที่ folders now: `12_280`, `12 of 280`, `ลำดับที่ 12`, `ชุดที่ 12`, `No.12`, `#12`, `Set 12`, and a bare number directly under the model folder (`8841/12/`) when its numbered sibling folders start at 1 (so year folders like `2023/`, `2024/` are not taken as sets). Without a total, the total comes from the numbered siblings (`_parse_set_folder_name()`).
 - **Thai numerals**: `ลำดับที่ ๑๒` / `ชุดที่ ๑/๓` in the document and `ลำดับที่ ๑๒` folder names are read as 12 / 1 of 3.

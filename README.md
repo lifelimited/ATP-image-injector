@@ -14,7 +14,7 @@ This tool automates the process of inserting device photos into Unit Test Word d
 
 ### Key Features
 
-- **Verify Photos (beta, v1.7.0-beta.4)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.2 is the stable version
+- **Verify Photos (beta, v1.7.0-beta.5)** — Optional: OCR every photo in the S/N and set-number folders and put a photo left in the wrong folder into the right table (Word output only, files on disk are not moved). Available as a [pre-release](../../releases); v1.6.2 is the stable version
 - **Auto Mode (new in v1.6.0)** — Finds the Serial Number anywhere in each table and picks the photo cell by itself. No keyword or layout setup, and it works with different table layouts in the same document
 - **Read S/N from Photos (OCR)** — Photos don't even need S/N folders: drop them into one folder and the app reads the S/N on each box label and groups the photos per device
 - **Dynamic Table Layout** — Automatically read the Word document so you can visually select where the S/N and Image cells are. No hardcoded formats!
@@ -329,6 +329,11 @@ If you were experiencing bugs in earlier v1.3.0/v1.2.x releases, these have now 
 - **EasyOCR Silently Failing**: Previously, `easyocr` wasn't bundled. We have updated `run.bat` to perform an initial `pip install` download of the 3GB Machine Learning libraries so the GPU rotation functions correctly natively.
 
 ## Changelog
+
+### v1.7.0-beta.5 (Pre-release)
+- 🔢 **`ลำดับที่` documents** — the ชุดที่ fallback also reads `ลำดับที่ N` (one cell with `Name :` / `P/N :`, no total); real IP-phone documents with numbered photo folders: 0 → 43/43 and 611/611 tables.
+- 📁 **More set-folder names** — `12_280`, `ลำดับที่ 12`, `ชุดที่ 12`, `No.12`, `#12`, and `Model/12/` without a `By_Number` folder.
+- ๑๒ **Thai numerals** in the document and folder names.
 
 ### v1.7.0-beta.4 (Pre-release)
 - Includes the v1.6.2 fix (`By_Number/<n>` folders).
