@@ -634,6 +634,46 @@ def test_lamdab_thi_numbering_running_on_across_models(tmp_path):
     assert [(e["pn"], e["n"], e["total"], e.get("n_doc")) for e in entries] == [
         ("CP-7821-K9=", 1, 2, 1), ("CP-7821-K9=", 2, 2, 2), ("CP-8841-K9=", 1, 2, 3), ("CP-8841-K9=", 2, 2, 4)]
 
+
+def test_parse_set_folder_names():
+    f = app._parse_set_folder_name
+    assert f("12") == (12, None, False)
+    assert f("12-280") == (12, 280, False) and f("12_280") == (12, 280, False) and f("12 of 280") == (12, 280, False)
+    assert f("ลำดับที่ 12") == (12, None, True) and f("ลำดับ 12") == (12, None, True)
+    assert f("ชุดที่ 12/280") == (12, 280, True) and f("No.12") == (12, None, True)
+    assert f("#12") == (12, None, True) and f("Set 3") == (3, None, True)
+    assert f("ลำดับที่ ๑๒") == (12, None, True)
+    for bad in ("WZP00000AAD", "IMG_0001", "photos", "2024-11-18 trip", "12345"):
+        assert f(bad) is None, bad
+
+
+def test_set_folders_without_by_number_container(tmp_path):
+    """Model/1, Model/2 ... (no By_Number) and 'ลำดับที่ n' / 'No.n' names are set folders;
+    year folders (2023, 2024) are not, and keep going to OCR as unnamed folders."""
+    root = tmp_path / "photos"
+    for n in (1, 2, 3):
+        _make_photo(str(root / "8841" / str(n)))
+        _make_photo(str(root / "7821" / f"ลำดับที่ {n}"))
+        _make_photo(str(root / "S5755" / f"No.{n}"))
+    _make_photo(str(root / "Trip" / "2023"))
+    _make_photo(str(root / "Trip" / "2024"))
+    got = sorted((f["model"], f["n"], f["total"]) for f in app.find_set_number_folders(str(root)))
+    assert got == sorted([(m, n, 3) for m in ("8841", "7821", "S5755") for n in (1, 2, 3)])
+    leaf = app.find_sn_leaf_folders(str(root))
+    assert sorted(leaf) == ["2023", "2024"]
+
+
+def test_thai_numerals_in_document(tmp_path):
+    p = str(tmp_path / "d.docx")
+    _lamdab_doc(p, ["AAA1234567", "BBB7654321"])
+    d = Document(p)
+    for t, thai in zip(d.tables, ("๑", "๒")):
+        cell = t.rows[0].cells[0]
+        cell.text = cell.text.replace("ลำดับที่ 1", f"ลำดับที่ {thai}").replace("ลำดับที่ 2", f"ลำดับที่ {thai}")
+    d.save(p)
+    entries = app.extract_set_entries(Document(p))
+    assert [(e["n_doc"], e["n"], e["total"]) for e in entries] == [(1, 1, 2), (2, 2, 2)]
+
 def test_assign_unread_far_from_any_label_stays_unassigned():
     """Mixed devices: other devices' photos (labels unreadable) shot minutes away are not pulled in."""
     seq = [("A", "A"), ("a1", None), ("s1", None), ("s2", None), ("B", "B"), ("x1", None), ("x2", None)]

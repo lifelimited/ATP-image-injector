@@ -622,33 +622,59 @@ STRICT_CAMERA_DIR_REGEX = re.compile(r"^(?:dcim|camera|\d{3}[a-z_][a-z0-9_]{1,4}
 _SN_VALUE_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/_.]{5,}$")
 
 
-_PLAIN_NUMBER_REGEX = re.compile(r"^\s*(\d{1,4})\s*$")
+THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+# Set-number folder names: '12', '12-280', '12_280', '12 of 280', 'ลำดับที่ 12', 'ชุดที่ 12/280', 'No.12', '#12', 'Set 12'
+_SET_FOLDER_NAME_REGEX = re.compile(
+    r"^\s*(?P<prefix>(?:ลำดับ|ชุด)\s*(?:ที่)?|no\.?|set|unit|#)?\s*[:.]?\s*(?P<n>\d{1,4})"
+    r"(?:\s*(?:[-_/]|of)\s*(?P<total>\d{1,4}))?\s*$", re.IGNORECASE)
+
+
+def _parse_set_folder_name(name: str):
+    """(n, total or None, has_prefix) for a set-number folder name, else None."""
+    m = _SET_FOLDER_NAME_REGEX.match((name or "").translate(THAI_DIGITS))
+    if not m:
+        return None
+    return int(m.group("n")), (int(m.group("total")) if m.group("total") else None), bool(m.group("prefix"))
 
 
 def _plain_set_number(dirpath: str, parts: list[str], cache: dict | None = None):
     """
-    (n, total) for a folder named only by a number inside a 'By_Number'-like container,
-    e.g. Model/By_Number/12/ = set 12. total = the number of numbered sibling folders or the
-    highest number among them, whichever is larger (empty siblings count: photos may be missing).
-    None for any other folder.
+    (n, total) when the folder is a ชุดที่ / ลำดับที่ folder, else None:
+      'n-total' / 'n_total' / 'n/total' names                  -> as written
+      'ลำดับที่ 12', 'ชุดที่ 12', 'No.12', '#12', 'Set 12'    -> total from the siblings
+      a bare number ('12') inside a 'By_Number'-like container, or next to other numbered
+      sibling folders that start at 1 (Model/12/)            -> total from the siblings
+    total from the siblings = the number of numbered sibling folders or the highest number,
+    whichever is larger (empty siblings count: photos may be missing). Year-like folders
+    (2023, 2024) are not set folders: their numbers do not start at 1.
     """
-    if len(parts) < 2 or not GENERIC_FOLDER_REGEX.match(parts[-2]):
+    if not parts:
         return None
-    m = _PLAIN_NUMBER_REGEX.match(parts[-1])
-    if not m:
+    parsed = _parse_set_folder_name(parts[-1])
+    if not parsed:
         return None
-    n = int(m.group(1))
+    n, total, prefix = parsed
+    if total is not None:
+        return (n, total) if 1 <= n <= total else None
     parent = os.path.dirname(dirpath)
-    total = cache.get(parent) if cache is not None else None
-    if total is None:
+    sib = cache.get(parent) if cache is not None else None
+    if sib is None:
         try:
-            nums = [int(d) for d in os.listdir(parent)
-                    if _PLAIN_NUMBER_REGEX.match(d) and os.path.isdir(os.path.join(parent, d))]
+            nums = []
+            for d in os.listdir(parent):
+                q = _parse_set_folder_name(d)
+                if q and q[1] is None and os.path.isdir(os.path.join(parent, d)):
+                    nums.append(q[0])
         except OSError:
             nums = [n]
-        total = max(len(nums), max(nums, default=n))
+        sib = (len(nums), max(nums, default=n), min(nums, default=n))
         if cache is not None:
-            cache[parent] = total
+            cache[parent] = sib
+    count, top, low = sib
+    in_container = len(parts) >= 2 and bool(GENERIC_FOLDER_REGEX.match(parts[-2]))
+    if not prefix and not in_container and not (count >= 2 and low == 1):
+        return None
+    total = max(count, top)
     return (n, total) if 1 <= n <= total else None
 
 
@@ -687,7 +713,7 @@ def find_sn_leaf_folders(root: str, log_cb=None) -> "SnFolderMap":
         if not parts:
             continue
         name = parts[-1]
-        if SEQ_FOLDER_REGEX.match(name) or _plain_set_number(dirpath, parts, plain_cache):
+        if _plain_set_number(dirpath, parts, plain_cache):
             continue
         if name in sn_map:
             if os.path.dirname(sn_map[name][0]) != dirpath:
@@ -1547,7 +1573,7 @@ def extract_set_entries(doc) -> list[dict]:
     for t_idx, table in enumerate(doc.tables, start=1):
         rows: dict[int, list] = {}
         for r, c, cell in _iter_unique_cells(table):
-            rows.setdefault(r, []).append((c, cell.text.strip()))
+            rows.setdefault(r, []).append((c, cell.text.strip().translate(THAI_DIGITS)))
         info: dict = {}
         for r in sorted(rows):
             cells = rows[r]
@@ -1672,14 +1698,10 @@ def find_set_number_folders(root: str) -> list[dict]:
             parts.pop()
         if not parts:
             continue
-        m = re.match(r"^\s*(\d{1,4})\s*[-_/]\s*(\d{1,4})\s*$", parts[-1])
-        if m:
-            n, total = int(m.group(1)), int(m.group(2))
-        else:
-            plain = _plain_set_number(dirpath, parts, plain_cache)
-            if not plain:
-                continue
-            n, total = plain
+        plain = _plain_set_number(dirpath, parts, plain_cache)
+        if not plain:
+            continue
+        n, total = plain
         if not (1 <= n <= total):
             continue
         ancestors = [p for p in reversed(parts[:-1]) if not GENERIC_FOLDER_REGEX.match(p)]
