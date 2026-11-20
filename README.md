@@ -24,13 +24,6 @@ flowchart TD
     V -.-> F
     F --> G["Prepare photos<br/>rotate · shrink · 4 workers"]
     G --> H["Save Word file<br/>+ summary report"]
-
-    classDef doc fill:#FAECE7,stroke:#993C1D,color:#712B13
-    classDef find fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    classDef build fill:#E1F5EE,stroke:#0F6E56,color:#085041
-    class C doc
-    class B,E,V find
-    class F,G build
 ```
 
 1. **Read the document first.** Every S/N in the Word file, its device models and its ชุดที่ (N/T) numbers are read before any photo is OCR'd. OCR only accepts a serial that is in the document, and model folders that are not in the document are skipped entirely.
