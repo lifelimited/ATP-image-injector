@@ -274,14 +274,19 @@ The app natively parses the first table in your Word document and displays it in
 ### Build the .exe yourself
 
 ```bash
-# Install PyInstaller
 pip install pyinstaller
 
-# Build standalone executable (bundles the OpenThai OCR model + its runtime imports)
-python -m PyInstaller --noconfirm --onefile --windowed --name "Unit_Test_Image_Injector_v1.6.2" --add-data "models\OpenThai2.0-OCR-Text;models\OpenThai2.0-OCR-Text" --hidden-import onnxruntime --hidden-import pyclipper --hidden-import cv2 --hidden-import unicodedata --exclude-module torch --exclude-module torchvision --exclude-module easyocr --exclude-module scipy --exclude-module matplotlib --exclude-module pandas --exclude-module pytest app.py
+# One-file exe: dist/Unit_Test_Image_Injector_v<version>.exe (version read from app.py)
+python -m PyInstaller --noconfirm injector.spec
+
+# Or a folder build that starts instantly (ship the folder as a .zip); in PowerShell: $env:BUILD_ONEDIR="1"
+BUILD_ONEDIR=1 python -m PyInstaller --noconfirm injector.spec
 ```
 
-The `.exe` will be created at `dist/Unit_Test_Image_Injector_v1.6.2.exe`. Without `--add-data` the exe still runs, but it downloads the OCR model from Hugging Face the first time Smart Rotate or OCR is used.
+`injector.spec` bundles the OCR model, leaves out packages the app does not use (PySide6, jedi, hf_xet,
+OpenCV's video DLL, ...) and takes the Microsoft C++ runtime from Windows, which onnxruntime needs (an
+older bundled `msvcp140.dll` makes OCR fail with "DLL initialization routine failed"). Start-up of the
+one-file exe: 6.6 s with the old command, 2.5 s with the spec; the folder build starts in 0.3 s.
 
 ## Requirements
 

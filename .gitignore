@@ -51,3 +51,4 @@ test/test_scan.py
 Thumbs.db
 .DS_Store
 desktop.ini
+!injector.spec
