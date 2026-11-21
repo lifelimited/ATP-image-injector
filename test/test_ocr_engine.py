@@ -61,3 +61,21 @@ def test_blank_image_returns_zero(engine):
     blank = Image.new("RGB", (800, 600), "white")
     assert detect_orientation(blank, engine)[0] == 0
 
+
+
+def test_model_download_is_pinned_to_v2_0_0(tmp_path, monkeypatch):
+    """A missing model is downloaded from the v2.0.0 tag, never the repository's moving main (now 2.1.x)."""
+    import types
+    import ocr_engine
+    calls = {}
+
+    def fake_download(**kw):
+        calls.update(kw)
+        for f in ocr_engine.REQUIRED_FILES:
+            dst = tmp_path / f
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("x")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=fake_download))
+    ocr_engine.ensure_model(tmp_path)
+    assert calls["revision"] == "v2.0.0"
+    assert calls["repo_id"] == ocr_engine.HF_REPO_ID

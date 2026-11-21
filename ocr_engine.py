@@ -45,7 +45,11 @@ def _resolve_default_model_dir() -> Path:
     return candidates[-1]
 
 
-HF_REPO_ID = "iapp/OpenThai2.0-OCR-Text"
+# iApp renamed the repository to OpenThai2.1-OCR-Text-20261118 (the old name redirects) and its main branch is
+# now 2.1.x. Pin the 2.0 release: the bundled files are v2.0.0, and on our S/N label photos 2.1.4 read the same
+# (440 of 442 photos identical) but took 45 % longer per photo.
+HF_REPO_ID = "iapp/OpenThai2.1-OCR-Text-20261118"
+HF_REVISION = "v2.0.0"
 DEFAULT_MODEL_DIR = _resolve_default_model_dir()
 REQUIRED_FILES = ("det.onnx", "rec.onnx", "rec_dict.txt", "config.json",
                   "runtime/__init__.py", "runtime/line_engine.py", "runtime/thai_norm.py")
@@ -108,15 +112,15 @@ def ensure_model(model_dir: Path, log_cb: LogCb = None) -> Path:
     if not missing:
         return model_dir
     if log_cb:
-        log_cb(f"      Downloading {HF_REPO_ID} (~4 MB) to {model_dir} ...")
+        log_cb(f"      Downloading {HF_REPO_ID} {HF_REVISION} (~4 MB) to {model_dir} ...")
     try:
         from huggingface_hub import snapshot_download
     except ImportError as e:
         raise RuntimeError(
             f"OpenThai model files missing ({', '.join(missing)}) and huggingface_hub "
             f"is not installed. Run: pip install huggingface_hub  — or download "
-            f"https://huggingface.co/{HF_REPO_ID} into {model_dir}") from e
-    snapshot_download(repo_id=HF_REPO_ID, local_dir=str(model_dir),
+            f"https://huggingface.co/{HF_REPO_ID}/tree/{HF_REVISION} into {model_dir}") from e
+    snapshot_download(repo_id=HF_REPO_ID, revision=HF_REVISION, local_dir=str(model_dir),
                       ignore_patterns=["pytorch/*", "*.pt"])
     still = [f for f in REQUIRED_FILES if not (model_dir / f).exists()]
     if still:
