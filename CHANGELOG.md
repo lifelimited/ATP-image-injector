@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [1.7.0-beta.6] - 2026-11-21 (pre-release)
 ### Fixed
 - **The exe opened slowly (6.6 s before the window could start).** The one-file exe unpacked 7,574 files / 365 MB on every start, much of it packages the app never uses (PySide6, jedi, hf_xet, OpenCV's video DLL). The new build file `injector.spec` leaves them out: 1,261 files / 242 MB, 99 MB exe, **2.5 s** to start (`BUILD_ONEDIR=1` builds a folder version that starts in 0.3 s). Same output on a full 1,094-photo delivery job.
 - **OCR in the exe depended on an accident.** PyInstaller bundled an old Microsoft C++ runtime (`msvcp140.dll` 14.36) and onnxruntime 1.27 fails to start with it ("DLL initialization routine failed" → OCR unavailable). Earlier exes only worked because the unused PySide6 brought a newer copy. `injector.spec` now bundles the runtime installed in Windows.

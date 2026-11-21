@@ -1,5 +1,5 @@
 """
-Unit Test Image Injector v1.7.0-beta.5 — Portable GUI App
+Unit Test Image Injector v1.7.0-beta.6 — Portable GUI App
 ====================================================
 Inserts device photos from SN folders into the
 Unit Test Word document, matching by Serial Number.
@@ -8,6 +8,7 @@ Supports: .jpg .jpeg .png .bmp .tiff .heic .heif
 Auto-converts HEIC/HEIF (iPhone photos) to JPG.
 
 Changelog:
+  v1.7.0-beta.6 — Exe starts 2.6x faster; Verify never moves photos to a serial without a table
   v1.7.0-beta.5 — ลำดับที่ documents, more set-folder names, Thai numerals
   v1.7.0-beta.4 — By_Number/<n> folders used as set-number folders (from v1.6.2)
   v1.7.0-beta.3 — Loading popup: no frozen window while a document / photo folder is read
@@ -27,7 +28,7 @@ Changelog:
 Usage: python app.py
 """
 
-__version__ = "1.7.0-beta.5"
+__version__ = "1.7.0-beta.6"
 __app_name__ = "Unit Test Image Injector"
 
 import sys
