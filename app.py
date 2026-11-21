@@ -1919,10 +1919,28 @@ def _swap_pair_proposals(folders: list[dict], proposals: list[dict], holders: di
     return extra
 
 
+def serials_with_own_table(doc, doc_serials: dict[str, str]) -> set:
+    """
+    Document serials that have a device table of their own (Auto mode finds them alone in a table, or a
+    'ชุดที่' entry names them). A serial written only in a summary / list table has nowhere to put photos.
+    """
+    idx = build_sn_index(list(doc_serials.values()))
+    own = set()
+    for table in doc.tables:
+        found = auto_locate_in_table(table, idx)
+        if found and found["status"] in ("ok", "no_image_cell"):
+            own.add(normalize_sn(found["sn"]))
+    own |= {normalize_sn(e.get("sn")) for e in extract_set_entries(doc) if e.get("sn")}
+    return own & set(doc_serials)
+
+
 def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holders: set | None = None,
-                        doc_serials: dict[str, str] | None = None, log_cb=None) -> list[dict]:
+                        doc_serials: dict[str, str] | None = None, log_cb=None,
+                        allowed_targets: set | None = None) -> list[dict]:
     """
     Accept the proposals that do not put photos into a table that already has its own photos.
+    allowed_targets: serials that have a device table of their own (serials_with_own_table); photos are
+    never moved to any other serial (they would leave their table and land nowhere).
     A target serial T is free only when every folder of T (its S/N folder, its set folder) ends up empty
     after its own accepted moves, T is not in fixed_holders (photos not verified, e.g. OCR-grouped), and
     all photos for T come from a single folder. Rejections are repeated until nothing changes (a rejected
@@ -1970,7 +1988,10 @@ def resolve_photo_moves(folders: list[dict], proposals: list[dict], fixed_holder
             sources.setdefault(pr["to"], set()).add(pr["folder"])
         bad = {}
         for target, srcs in sources.items():
-            if target in fixed_holders:
+            if allowed_targets is not None and target not in allowed_targets:
+                bad[target] = ("it has no device table of its own in the document (only in a list) - "
+                               "the document may have a wrong or copied S/N")
+            elif target in fixed_holders:
                 bad[target] = "its table already has photos (OCR-grouped)"
             elif len(srcs) > 1:
                 bad[target] = "photos of it found in several folders (" + ", ".join(
@@ -2489,7 +2510,8 @@ def _verify_and_move_photos(doc, sn_root: str, sn_folders: dict, sn_to_model: di
     for pr in props:
         pr["folder"] = check_idx[pr["folder"]]
     accepted = resolve_photo_moves(folders, props, fixed_holders=set(ocr_grouped),
-                                   doc_serials=doc_serials, log_cb=log)
+                                   doc_serials=doc_serials, log_cb=log,
+                                   allowed_targets=serials_with_own_table(doc, doc_serials))
     if not accepted:
         log("  Verify photos: no photo needs moving")
         return 0

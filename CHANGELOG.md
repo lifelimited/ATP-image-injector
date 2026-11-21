@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 ### Fixed
+- **Verify photos could take photos out of a table and put them nowhere.** When a box's label names a serial that is written only in the document's summary list (no device table of its own, e.g. a set whose S/N was copied from another set by mistake), Verify moved the photos to that serial and the set's table ended up empty. Photos now move only to a serial with its own device table; otherwise they stay and the log warns `NOT moved: it has no device table of its own ... the document may have a wrong or copied S/N` (`serials_with_own_table()`). Found on a real delivery document (set 14/30 of a switch group, whose S/N copies set 12/30).
 - **OCR model download pinned to OpenThai2.0 (`v2.0.0`).** iApp renamed the model repository to `iapp/OpenThai2.1-OCR-Text-20261118` (the old name redirects) and its main branch is now 2.1.4, so a PC without the bundled model files would have downloaded a different model and runtime. The download now asks for the `v2.0.0` tag, byte-identical to the bundled files (`HF_REVISION` in `ocr_engine.py`). 2.1.4 was compared on 442 S/N label photos of 150 devices: same accuracy (440 photos read identically; 263/268 correct label reads against 263/268), 1.39 s per photo against 0.96 s, so the app stays on 2.0.
 
 ## [1.7.0-beta.5] - 2026-11-20 (pre-release)

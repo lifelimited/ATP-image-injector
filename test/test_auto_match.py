@@ -1099,3 +1099,28 @@ def test_verify_swap_both_halves_lookalike_needs_confirmed_rereads(tmp_path, mon
     assert any("[SWAP]" in line for line in logs)
     moved = open(res["summary_path"], encoding="utf-8-sig").read()
     assert "Photos moved (wrong folder) (4)" in moved
+
+
+def test_verify_never_moves_to_serial_without_own_table(tmp_path, monkeypatch):
+    """Real case (made-up serials here): the document copies set 1's S/N into set 2, and the box of set 2
+    really carries a serial that appears only in the summary list. Its photos must stay in set 2."""
+    def docf(path):
+        doc = Document()
+        t = doc.add_table(rows=4, cols=3)
+        for c, h in enumerate(["No.", "Description", "Serial Number"]):
+            t.rows[0].cells[c].text = h
+        for r, sn in enumerate(["AAA1234567", "BBB7654321", "CCC1112223"], start=1):
+            t.rows[r].cells[0].text = str(r)
+            t.rows[r].cells[1].text = "Switch"
+            t.rows[r].cells[2].text = sn
+        _detail_table(doc, "Switch", 1, 2, "PN-1", "AAA1234567")
+        _detail_table(doc, "Switch", 2, 2, "PN-1", "AAA1234567")   # document error: should be CCC1112223
+        doc.save(str(path))
+    root = tmp_path / "photos"
+    _photo(str(root / "Switch" / "By_Number" / "2-2" / "1.png"), (9, 9, 9))
+    _photo(str(root / "Switch" / "By_Number" / "2-2" / "2.png"), _GREY)
+    res, d, logs = _run_verify(tmp_path, monkeypatch, root, docf=docf,
+                               by_color={(9, 9, 9): ["S/N: CCC1112223"]})
+    assert _count_pictures(d.tables[2]) == 2            # set 2 keeps its photos (ชุดที่ fallback)
+    assert any("NOT moved" in line and "no device table" in line for line in logs)
+    assert "Photos moved" not in open(res["summary_path"], encoding="utf-8-sig").read()
