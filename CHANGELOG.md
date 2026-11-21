@@ -3,6 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Fixed
+- **OCR model download pinned to OpenThai2.0 (`v2.0.0`).** iApp renamed the model repository to `iapp/OpenThai2.1-OCR-Text-20261118` (the old name redirects) and its main branch is now 2.1.4, so a PC without the bundled model files would have downloaded a different model and runtime. The download now asks for the `v2.0.0` tag, byte-identical to the bundled files (`HF_REVISION` in `ocr_engine.py`). 2.1.4 was compared on 442 S/N label photos of 150 devices: same accuracy (440 photos read identically; 263/268 correct label reads against 263/268), 1.39 s per photo against 0.96 s, so the app stays on 2.0.
 
 ## [1.7.0-beta.5] - 2026-11-20 (pre-release)
 ### Added
